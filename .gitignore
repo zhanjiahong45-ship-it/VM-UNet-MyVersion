@@ -1,0 +1,66 @@
+# ==========================================
+# 1. 深度学习项目核心拦截（数据、预训练模型、训练结果）
+# ==========================================
+# 忽略数据文件夹（拦截所有图片、切片和打包数据）
+data/
+
+# 忽略预训练模型文件夹
+pre_trained_weights/
+pretrained_weights/
+pre_trained/
+
+# 忽略训练输出文件夹（拦截每次训练产生的 checkpoints, logs, outputs 等）
+results/
+runs/
+output/
+outputs/
+checkpoints/
+log/
+summary/
+
+# 全局大文件后缀兜底拦截（防止你手滑把数据放到了根目录）
+*.pth
+*.pt
+*.ckpt
+*.weights
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.nii
+*.nii.gz
+
+# ==========================================
+# 2. Python 与 PyCharm 基础环境拦截
+# ==========================================
+# PyCharm 配置文件 (强烈建议忽略，防止本地路径配置冲突)
+.idea/
+
+# 虚拟环境 (包含大量环境包，千万别传)
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# MacOS 系统级垃圾文件 (如果你用 Mac 的话)
+.DS_Store
+
+# ==========================================
+# 3. 其他常规 Python 忽略项
+# ==========================================
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+.coverage
+htmlcov/
+.pytest_cache/
