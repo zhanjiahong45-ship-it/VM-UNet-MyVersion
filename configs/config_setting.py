@@ -14,7 +14,7 @@ class setting_config:
         'input_channels': 3,
         # ----- VM-UNet ----- #
         # 核心修改 1：深度匹配预训练权重 (Small 级别)
-        'depths': [2, 2, 2, 2],
+        'depths': [2, 2, 9, 2],
         'depths_decoder': [2, 2, 2, 1],
         'drop_path_rate': 0.2,
         'load_ckpt_path': './pre_trained_weights/vmamba_small_e238_ema.pth',
@@ -53,9 +53,9 @@ class setting_config:
     print_interval = 20
     val_interval = 30
     save_interval = 100
-    threshold = 0.518
-    only_test_and_save_figs = False
-    best_ckpt_path = '/root/root/VM-UNet/results/xiwang/checkpoints/best-epoch32-loss0.2708.pth'
+    threshold = 0.50
+    only_test_and_save_figs = True
+    best_ckpt_path = '/root/root/VM-UNet/results/vmunet_isic18_Wednesday_04_March_2026_21h_14m_52s/checkpoints/best-epoch95-loss0.3762.pth'
     img_save_path = '/root/root/VM-UNet/test_outputs/'
 
     train_transformer = transforms.Compose([

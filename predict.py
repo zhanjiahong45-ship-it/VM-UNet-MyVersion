@@ -8,7 +8,7 @@ from PIL import Image
 from models.vmunet.vmunetff import VMUNet
 
 # --- 配置参数 ---
-MODEL_PATH = '/root/root/VM-UNet/results/xiwang/checkpoints/best-epoch32-loss0.2708.pth'
+MODEL_PATH = '/root/root/VM-UNet/results/vmunet_isic18_Wednesday_04_March_2026_21h_14m_52s/checkpoints/best-epoch95-loss0.3762.pth'
 IMG_SIZE = 256
 INPUT_DIR = 'inputs'
 OUTPUT_DIR = 'outputO'

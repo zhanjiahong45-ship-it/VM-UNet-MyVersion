@@ -198,63 +198,31 @@ def test_one_epoch(test_loader,
 
             out = out.squeeze(1).cpu().detach().numpy()
             preds.append(out)
-
-            # 注意：保存图片这里默认用的 config.threshold，因为此时还不知道最佳阈值
             if i % config.save_interval == 0:
-                save_imgs(img.cpu(), msk, out, i, config.work_dir + 'outputs/', config.datasets, config.threshold,
+                save_imgs(img, msk, out, i, config.work_dir + 'outputs/', config.datasets, config.threshold,
                           test_data_name=test_data_name)
 
         preds = np.array(preds).reshape(-1)
         gts = np.array(gts).reshape(-1)
 
-        # 固定真实标签的阈值
+        y_pre = np.where(preds >= config.threshold, 1, 0)
         y_true = np.where(gts >= 0.5, 1, 0)
 
-        # ====================================================================
-        # 👑 终极压榨：暴力搜索最佳阈值 (Threshold Grid Search)
-        # ====================================================================
-        best_miou = 0.0
-        best_thresh = config.threshold
-        best_metrics = {}
+        confusion = confusion_matrix(y_true, y_pre)
+        TN, FP, FN, TP = confusion[0, 0], confusion[0, 1], confusion[1, 0], confusion[1, 1]
 
-        print("\n🚀 开始搜索最佳阈值...")
-        # 从 0.15 搜到 0.50，步长 0.01
-        for thresh in np.arange(0.15, 0.51, 0.01):
-            y_pre = np.where(preds >= thresh, 1, 0)
-            confusion = confusion_matrix(y_true, y_pre)
-            TN, FP, FN, TP = confusion[0, 0], confusion[0, 1], confusion[1, 0], confusion[1, 1]
-
-            miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
-
-            # 如果当前阈值跑出的 miou 更高，更新最佳记录
-            if miou > best_miou:
-                best_miou = miou
-                best_thresh = thresh
-                accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
-                sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
-                specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
-                f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
-
-                best_metrics = {
-                    'miou': miou, 'f1_or_dsc': f1_or_dsc, 'accuracy': accuracy,
-                    'specificity': specificity, 'sensitivity': sensitivity, 'confusion': confusion
-                }
-
-        # 拿出最高分的数据
-        miou = best_metrics['miou']
-        f1_or_dsc = best_metrics['f1_or_dsc']
-        accuracy = best_metrics['accuracy']
-        specificity = best_metrics['specificity']
-        sensitivity = best_metrics['sensitivity']
-        confusion = best_metrics['confusion']
+        accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
+        sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
+        specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
+        f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
+        miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
 
         if test_data_name is not None:
             log_info = f'test_datasets_name: {test_data_name}'
             print(log_info)
             logger.info(log_info)
-
-        # 打印霸气的最终结果
-        log_info = f'👑 [Best Thresh: {best_thresh:.2f}] test of best model, loss: {np.mean(loss_list):.4f}, miou: {miou:.4f}, f1_or_dsc: {f1_or_dsc:.4f}, accuracy: {accuracy:.4f}, specificity: {specificity:.4f}, sensitivity: {sensitivity:.4f}, confusion_matrix: {confusion}'
+        log_info = f'test of best model, loss: {np.mean(loss_list):.4f},miou: {miou}, f1_or_dsc: {f1_or_dsc}, accuracy: {accuracy}, \
+                specificity: {specificity}, sensitivity: {sensitivity}, confusion_matrix: {confusion}'
         print(log_info)
         logger.info(log_info)
 

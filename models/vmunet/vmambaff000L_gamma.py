@@ -55,12 +55,52 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     assert not with_complex
 
     flops = 0  # below code flops = 0
+    if False:
+        ...
+        """
+        dtype_in = u.dtype
+        u = u.float()
+        delta = delta.float()
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None].float()
+        if delta_softplus:
+            delta = F.softplus(delta)
+        batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+        is_variable_B = B.dim() >= 3
+        is_variable_C = C.dim() >= 3
+        if A.is_complex():
+            if is_variable_B:
+                B = torch.view_as_complex(rearrange(B.float(), "... (L two) -> ... L two", two=2))
+            if is_variable_C:
+                C = torch.view_as_complex(rearrange(C.float(), "... (L two) -> ... L two", two=2))
+        else:
+            B = B.float()
+            C = C.float()
+        x = A.new_zeros((batch, dim, dstate))
+        ys = []
+        """
 
     flops += get_flops_einsum([[B, D, L], [D, N]], "bdl,dn->bdln")
     if with_Group:
         flops += get_flops_einsum([[B, D, L], [B, N, L], [B, D, L]], "bdl,bnl,bdl->bdln")
     else:
         flops += get_flops_einsum([[B, D, L], [B, D, N, L], [B, D, L]], "bdl,bdnl,bdl->bdln")
+    if False:
+        ...
+        """
+        deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+        if not is_variable_B:
+            deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
+        else:
+            if B.dim() == 3:
+                deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+            else:
+                B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+                deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B, u)
+        if is_variable_C and C.dim() == 4:
+            C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
+        last_state = None
+        """
 
     in_for_flops = B * D * N
     if with_Group:
@@ -68,14 +108,46 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     else:
         in_for_flops += get_flops_einsum([[B, D, N], [B, N]], "bdn,bn->bd")
     flops += L * in_for_flops
+    if False:
+        ...
+        """
+        for i in range(u.shape[2]):
+            x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+            if not is_variable_C:
+                y = torch.einsum('bdn,dn->bd', x, C)
+            else:
+                if C.dim() == 3:
+                    y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+                else:
+                    y = torch.einsum('bdn,bdn->bd', x, C[:, :, :, i])
+            if i == u.shape[2] - 1:
+                last_state = x
+            if y.is_complex():
+                y = y.real * 2
+            ys.append(y)
+        y = torch.stack(ys, dim=2) # (batch dim L)
+        """
 
     if with_D:
         flops += B * D * L
     if with_Z:
         flops += B * D * L
+    if False:
+        ...
+        """
+        out = y if D is None else y + u * rearrange(D, "d -> d 1")
+        if z is not None:
+            out = out * F.silu(z)
+        out = out.to(dtype=dtype_in)
+        """
 
     return flops
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import kornia
 
 class FCD_Module(nn.Module):
     r"""
@@ -175,7 +247,13 @@ class FCD_Module(nn.Module):
 
 
 class PatchEmbed2D(nn.Module):
-    r""" Image to Patch Embedding """
+    r""" Image to Patch Embedding
+    Args:
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
 
     def __init__(self, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None, **kwargs):
         super().__init__()
@@ -195,7 +273,12 @@ class PatchEmbed2D(nn.Module):
 
 
 class PatchMerging2D(nn.Module):
-    r""" Patch Merging Layer. """
+    r""" Patch Merging Layer.
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
 
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -275,6 +358,7 @@ class SS2D(nn.Module):
             self,
             d_model,
             d_state=16,
+            # d_state="auto", # 20240109
             d_conv=3,
             expand=2,
             dt_rank="auto",
@@ -294,6 +378,7 @@ class SS2D(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
+        # self.d_state = math.ceil(self.d_model / 6) if d_state == "auto" else d_model # 20240109
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
@@ -311,14 +396,13 @@ class SS2D(nn.Module):
         )
         self.act = nn.SiLU()
 
-        # ================= 预训练的 K=4 部分 (必须严格保持命名与维度) =================
         self.x_proj = (
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
         )
-        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # shape: [4, N, inner]
+        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
         del self.x_proj
 
         self.dt_projs = (
@@ -331,43 +415,26 @@ class SS2D(nn.Module):
             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
                          **factory_kwargs),
         )
-        self.dt_projs_weight = nn.Parameter(
-            torch.stack([t.weight for t in self.dt_projs], dim=0))  # shape: [4, inner, rank]
-        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # shape: [4, inner]
+        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K=4, inner, rank)
+        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
         del self.dt_projs
 
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)
-        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N)
 
-        # ================= 新增的 第 5 条螺旋路径专属参数 (K=1) =================
-        self.x_proj_spiral = nn.Parameter(
-            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs).weight)
-
-        dt_proj_spiral = self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
-                                      **factory_kwargs)
-        self.dt_projs_weight_spiral = nn.Parameter(dt_proj_spiral.weight)
-        self.dt_projs_bias_spiral = nn.Parameter(dt_proj_spiral.bias)
-
-        self.A_logs_spiral = self.A_log_init(self.d_state, self.d_inner, copies=1, merge=True)
-        self.Ds_spiral = self.D_init(self.d_inner, copies=1, merge=True)
-
-        # 【核心创新】：0初始化门控，防止新增路径破坏预训练平衡
-        self.spiral_alpha = nn.Parameter(torch.zeros(1))
-        # =========================================================================
-
-        self.forward_core = self.forward_core_decoupled
+        # self.selective_scan = selective_scan_fn
+        self.forward_core = self.forward_corev0
 
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-
-        self.spiral_cache = {}
 
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
 
+        # Initialize special dt projection to preserve variance at initialization
         dt_init_std = dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(dt_proj.weight, dt_init_std)
@@ -376,25 +443,29 @@ class SS2D(nn.Module):
         else:
             raise NotImplementedError
 
+        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             dt_proj.bias.copy_(inv_dt)
+        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
         dt_proj.bias._no_reinit = True
 
         return dt_proj
 
     @staticmethod
     def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+        # S4D real initialization
         A = repeat(
             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
             "n -> d n",
             d=d_inner,
         ).contiguous()
-        A_log = torch.log(A)
+        A_log = torch.log(A)  # Keep A_log in fp32
         if copies > 1:
             A_log = repeat(A_log, "d n -> r d n", r=copies)
             if merge:
@@ -405,125 +476,95 @@ class SS2D(nn.Module):
 
     @staticmethod
     def D_init(d_inner, copies=1, device=None, merge=True):
+        # D "skip" parameter
         D = torch.ones(d_inner, device=device)
         if copies > 1:
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D)
+        D = nn.Parameter(D)  # Keep in fp32
         D._no_weight_decay = True
         return D
 
-    def forward_core_decoupled(self, x: torch.Tensor):
-        """
-        分为两阶段分别进行 Mamba 扫描，彻底避免维度冲突
-        """
-        # 为了兼容不同的 mamba_ssm 版本
-        try:
-            self.selective_scan = selective_scan_fn
-            v1_flag = False
-        except:
-            self.selective_scan = selective_scan_fn_v1
-            v1_flag = True
+    def forward_corev0(self, x: torch.Tensor):
+        self.selective_scan = selective_scan_fn
 
         B, C, H, W = x.shape
         L = H * W
+        K = 4
 
-        # ================= 阶段 1: 处理预训练的 4 条基准路径 =================
         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
                              dim=1).view(B, 2, -1, L)
-        xs_4 = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, 4, d, l)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, k, d, l)
 
-        x_dbl_4 = torch.einsum("b k d l, k c d -> b k c l", xs_4.view(B, 4, -1, L), self.x_proj_weight)
-        dts_4, Bs_4, Cs_4 = torch.split(x_dbl_4, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        dts_4 = torch.einsum("b k r l, k d r -> b k d l", dts_4.view(B, 4, -1, L), self.dt_projs_weight)
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        # x_dbl = x_dbl + self.x_proj_bias.view(1, K, -1, 1)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+        # dts = dts + self.dt_projs_bias.view(1, K, -1, 1)
 
-        xs_4 = xs_4.float().view(B, -1, L)
-        dts_4 = dts_4.contiguous().float().view(B, -1, L)
-        Bs_4 = Bs_4.float().view(B, 4, -1, L)
-        Cs_4 = Cs_4.float().view(B, 4, -1, L)
-        Ds_4 = self.Ds.float().view(-1)
-        As_4 = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
-        dt_projs_bias_4 = self.dt_projs_bias.float().view(-1)
+        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+        Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Ds = self.Ds.float().view(-1)  # (k * d)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
 
-        if not v1_flag:
-            out_y_4 = self.selective_scan(
-                xs_4, dts_4, As_4, Bs_4, Cs_4, Ds_4, z=None,
-                delta_bias=dt_projs_bias_4, delta_softplus=True, return_last_state=False,
-            ).view(B, 4, -1, L)
-        else:
-            out_y_4 = self.selective_scan(
-                xs_4, dts_4, As_4, Bs_4, Cs_4, Ds_4,
-                delta_bias=dt_projs_bias_4, delta_softplus=True,
-            ).view(B, 4, -1, L)
+        out_y = self.selective_scan(
+            xs, dts,
+            As, Bs, Cs, Ds, z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(B, K, -1, L)
+        assert out_y.dtype == torch.float
 
-        assert out_y_4.dtype == torch.float
-
-        # ================= 阶段 2: 处理新增的 1 条螺旋扩张路径 =================
-        device = x.device
-        cache_key = (H, W, device)
-
-        if cache_key not in self.spiral_cache:
-            idx = []
-            top, bottom, left, right = 0, H - 1, 0, W - 1
-            matrix = torch.arange(L, device=device).view(H, W)
-            # 生成边缘向中心顺时针螺旋
-            while top <= bottom and left <= right:
-                idx.append(matrix[top, left:right + 1])
-                top += 1
-                if top <= bottom:
-                    idx.append(matrix[top:bottom + 1, right])
-                    right -= 1
-                if top <= bottom and left <= right:
-                    idx.append(matrix[bottom, left:right + 1].flip(0))
-                    bottom -= 1
-                if top <= bottom and left <= right:
-                    idx.append(matrix[top:bottom + 1, left].flip(0))
-                    left += 1
-            idx_cw_inward = torch.cat(idx)
-            # 翻转：得到中心向边缘的逆时针扩张螺旋
-            idx_ccw_outward = idx_cw_inward.flip(0)
-
-            inv_idx = torch.empty_like(idx_ccw_outward)
-            inv_idx[idx_ccw_outward] = torch.arange(L, device=device)
-            self.spiral_cache[cache_key] = (idx_ccw_outward, inv_idx)
-
-        idx_spiral, inv_idx_spiral = self.spiral_cache[cache_key]
-
-        xs_1 = x.view(B, -1, L)[:, :, idx_spiral].unsqueeze(1)  # (b, 1, d, l)
-
-        x_dbl_1 = torch.einsum("b k d l, c d -> b k c l", xs_1.view(B, 1, -1, L), self.x_proj_spiral)
-        dts_1, Bs_1, Cs_1 = torch.split(x_dbl_1, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        dts_1 = torch.einsum("b k r l, d r -> b k d l", dts_1.view(B, 1, -1, L), self.dt_projs_weight_spiral)
-
-        xs_1 = xs_1.float().view(B, -1, L)
-        dts_1 = dts_1.contiguous().float().view(B, -1, L)
-        Bs_1 = Bs_1.float().view(B, 1, -1, L)
-        Cs_1 = Cs_1.float().view(B, 1, -1, L)
-        Ds_1 = self.Ds_spiral.float().view(-1)
-        As_1 = -torch.exp(self.A_logs_spiral.float()).view(-1, self.d_state)
-        dt_projs_bias_1 = self.dt_projs_bias_spiral.float().view(-1)
-
-        if not v1_flag:
-            out_y_1 = self.selective_scan(
-                xs_1, dts_1, As_1, Bs_1, Cs_1, Ds_1, z=None,
-                delta_bias=dt_projs_bias_1, delta_softplus=True, return_last_state=False,
-            ).view(B, 1, -1, L)
-        else:
-            out_y_1 = self.selective_scan(
-                xs_1, dts_1, As_1, Bs_1, Cs_1, Ds_1,
-                delta_bias=dt_projs_bias_1, delta_softplus=True,
-            ).view(B, 1, -1, L)
-
-        # ================= 阶段 3: 逆向映射还原回 2D 空间 =================
-        inv_y = torch.flip(out_y_4[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        wh_y = torch.transpose(out_y_4[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
 
-        y_spiral_restored = out_y_1[:, 0][:, :, inv_idx_spiral]
+        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
 
-        # 返回 5 个独立的张量
-        return out_y_4[:, 0], inv_y[:, 0], wh_y, invwh_y, y_spiral_restored
+    # an alternative to forward_corev1
+    def forward_corev1(self, x: torch.Tensor):
+        self.selective_scan = selective_scan_fn_v1
+
+        B, C, H, W = x.shape
+        L = H * W
+        K = 4
+
+        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
+                             dim=1).view(B, 2, -1, L)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)  # (b, k, d, l)
+
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        # x_dbl = x_dbl + self.x_proj_bias.view(1, K, -1, 1)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+        # dts = dts + self.dt_projs_bias.view(1, K, -1, 1)
+
+        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+        Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Ds = self.Ds.float().view(-1)  # (k * d)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
+
+        out_y = self.selective_scan(
+            xs, dts,
+            As, Bs, Cs, Ds,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+        ).view(B, K, -1, L)
+        assert out_y.dtype == torch.float
+
+        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+
+        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
@@ -533,16 +574,9 @@ class SS2D(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))  # (b, d, h, w)
-
-        y1, y2, y3, y4, y5 = self.forward_core(x)
-
-        # =================【最关键融合】=================
-        # 前 4 条路径由于继承了预训练权重，具备极强的全局感知力，直接相加。
-        # 第 5 条螺旋路径起初随机，受门控 spiral_alpha(=0) 压制；
-        # 随着训练，模型学习到它的扩张补全能力，alpha 将变大。
-        y = y1 + y2 + y3 + y4 + (self.spiral_alpha * y5)
-        # ==============================================
-
+        y1, y2, y3, y4 = self.forward_core(x)
+        assert y1.dtype == torch.float32
+        y = y1 + y2 + y3 + y4
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
         y = y * F.silu(z)
@@ -573,6 +607,18 @@ class VSSBlock(nn.Module):
 
 
 class VSSLayer(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+    Args:
+        dim (int): Number of input channels.
+        depth (int): Number of blocks.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
     def __init__(
             self,
             dim,
@@ -599,11 +645,11 @@ class VSSLayer(nn.Module):
             )
             for i in range(depth)])
 
-        if True:
+        if True:  # is this really applied? Yes, but been overriden later in VSSM!
             def _init_weights(module: nn.Module):
                 for name, p in module.named_parameters():
                     if name in ["out_proj.weight"]:
-                        p = p.clone().detach_()
+                        p = p.clone().detach_()  # fake init, just to keep the seed ....
                         nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
             self.apply(_init_weights)
@@ -627,6 +673,18 @@ class VSSLayer(nn.Module):
 
 
 class VSSLayer_up(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
+    Args:
+        dim (int): Number of input channels.
+        depth (int): Number of blocks.
+        drop (float, optional): Dropout rate. Default: 0.0
+        attn_drop (float, optional): Attention dropout rate. Default: 0.0
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+    """
+
     def __init__(
             self,
             dim,
@@ -653,11 +711,11 @@ class VSSLayer_up(nn.Module):
             )
             for i in range(depth)])
 
-        if True:
+        if True:  # is this really applied? Yes, but been overriden later in VSSM!
             def _init_weights(module: nn.Module):
                 for name, p in module.named_parameters():
                     if name in ["out_proj.weight"]:
-                        p = p.clone().detach_()
+                        p = p.clone().detach_()  # fake init, just to keep the seed ....
                         nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
             self.apply(_init_weights)
@@ -693,18 +751,21 @@ class VSSM(nn.Module):
         self.num_features = dims[-1]
         self.dims = dims
 
-        # 挂载带有物理清洗和自适应增强机制的 FCD_Module
+        # 【核心修改点】直接将 FCD_Module 命名为 patch_embed，使其能够完全替代原版的 PatchEmbed2D 并完美加载预训练权重
         self.patch_embed = FCD_Module(patch_size=patch_size, in_chans=in_chans, embed_dim=self.embed_dim,
                                       norm_layer=norm_layer if patch_norm else None)
 
+        # WASTED absolute position embedding ======================
         self.ape = False
+        # self.ape = False
+        # drop_rate = 0.0
         if self.ape:
             self.patches_resolution = self.patch_embed.patches_resolution
             self.absolute_pos_embed = nn.Parameter(torch.zeros(1, *self.patches_resolution, self.embed_dim))
             trunc_normal_(self.absolute_pos_embed, std=.02)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         dpr_decoder = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_decoder))][::-1]
 
         self.layers = nn.ModuleList()
@@ -712,7 +773,7 @@ class VSSM(nn.Module):
             layer = VSSLayer(
                 dim=dims[i_layer],
                 depth=depths[i_layer],
-                d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,
+                d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,  # 20240109
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
@@ -727,7 +788,7 @@ class VSSM(nn.Module):
             layer = VSSLayer_up(
                 dim=dims_decoder[i_layer],
                 depth=depths_decoder[i_layer],
-                d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,
+                d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,  # 20240109
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 drop_path=dpr_decoder[sum(depths_decoder[:i_layer]):sum(depths_decoder[:i_layer + 1])],
@@ -761,6 +822,7 @@ class VSSM(nn.Module):
 
     def forward_features(self, x):
         skip_list = []
+        # 直接使用包含 FCD 的 patch_embed 进行前向传播
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
