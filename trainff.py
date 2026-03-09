@@ -82,9 +82,11 @@ def main(config):
     scheduler = get_scheduler(config, optimizer)
 
     print('#----------Set other params----------#')
-    min_loss = 999
+    # 【核心修改 1】：抛弃 min_loss，改用 max_miou 记录最佳状态
+    max_miou = 0.0
+    best_loss = 999.0
+    best_epoch = 1
     start_epoch = 1
-    min_epoch = 1
 
     if config.only_test_and_save_figs:
         checkpoint = torch.load(config.best_ckpt_path, map_location=torch.device('cpu'))
@@ -109,9 +111,13 @@ def main(config):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         saved_epoch = checkpoint['epoch']
         start_epoch += saved_epoch
-        min_loss, min_epoch, loss = checkpoint['min_loss'], checkpoint['min_epoch'], checkpoint['loss']
 
-        log_info = f'resuming model from {resume_model}. resume_epoch: {saved_epoch}, min_loss: {min_loss:.4f}, min_epoch: {min_epoch}, loss: {loss:.4f}'
+        # 【核心修改 2】：适配断点续训，读取 miou 相关信息
+        max_miou = checkpoint.get('max_miou', 0.0)
+        best_epoch = checkpoint.get('best_epoch', 1)
+        best_loss = checkpoint.get('best_loss', 999.0)
+
+        log_info = f'resuming model from {resume_model}. resume_epoch: {saved_epoch}, max_miou: {max_miou:.4f}, best_epoch: {best_epoch}, loss: {best_loss:.4f}'
         logger.info(log_info)
 
     step = 0
@@ -133,7 +139,8 @@ def main(config):
             writer
         )
 
-        loss = val_one_epoch(
+        # 【核心修改 3】：获取 val_one_epoch 返回的 loss 和 miou
+        val_result = val_one_epoch(
             val_loader,
             model,
             criterion,
@@ -142,17 +149,39 @@ def main(config):
             config
         )
 
-        if loss < min_loss:
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best.pth'))
-            min_loss = loss
-            min_epoch = epoch
+        # 鲁棒性检查：判断 engine.py 是否已经被修改为返回 (loss, miou)
+        if isinstance(val_result, tuple):
+            loss, current_miou = val_result[0], val_result[1]
+        else:
+            loss = val_result
+            current_miou = 0.0
+            print("WARNING: 未检测到 mIoU 返回值，正在使用备用 Loss 判定机制！(请检查 engine.py)")
 
+        # 【核心修改 4】：全新的“唯 mIoU 论”保存逻辑
+        is_best = False
+        if current_miou > 0:
+            if current_miou > max_miou:
+                is_best = True
+                max_miou = current_miou
+                best_loss = loss
+                best_epoch = epoch
+        else:
+            # 兼容性备用方案：如果你还没改 engine.py，它依然能按 loss 跑，不会报错
+            if loss < best_loss:
+                is_best = True
+                best_loss = loss
+                best_epoch = epoch
+
+        if is_best:
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best.pth'))
+
+        # 【核心修改 5】：把最佳 mIoU 信息存入 latest.pth 以备断点续训
         torch.save(
             {
                 'epoch': epoch,
-                'min_loss': min_loss,
-                'min_epoch': min_epoch,
-                'loss': loss,
+                'max_miou': max_miou,
+                'best_epoch': best_epoch,
+                'best_loss': best_loss,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
@@ -169,9 +198,11 @@ def main(config):
             logger,
             config,
         )
+
+        # 【核心修改 6】：最终生成的文件名会骄傲地打上 miou 的印记
         os.rename(
             os.path.join(checkpoint_dir, 'best.pth'),
-            os.path.join(checkpoint_dir, f'best-epoch{min_epoch}-loss{min_loss:.4f}.pth')
+            os.path.join(checkpoint_dir, f'best-epoch{best_epoch}-miou{max_miou:.4f}.pth')
         )
 
 

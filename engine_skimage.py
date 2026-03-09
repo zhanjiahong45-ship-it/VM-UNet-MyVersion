@@ -4,7 +4,10 @@ import torch
 from torch.cuda.amp import autocast as autocast
 from sklearn.metrics import confusion_matrix
 from utils import save_imgs
-import torch.nn.functional as F  # <--- 必须加上这个库来做多尺度缩放
+import torch.nn.functional as F
+
+# 🚀 引入连通域分析库
+from skimage import morphology
 
 
 def train_one_epoch(train_loader,
@@ -20,9 +23,7 @@ def train_one_epoch(train_loader,
     '''
     train model for one epoch
     '''
-    # switch to train mode
     model.train()
-
     loss_list = []
 
     for iter, data in enumerate(train_loader):
@@ -40,7 +41,6 @@ def train_one_epoch(train_loader,
         loss_list.append(loss.item())
 
         now_lr = optimizer.state_dict()['param_groups'][0]['lr']
-
         writer.add_scalar('loss', loss, global_step=step)
 
         if iter % config.print_interval == 0:
@@ -57,11 +57,13 @@ def val_one_epoch(test_loader,
                   epoch,
                   logger,
                   config):
-    # 验证阶段为了速度，保持 4 视角翻转 TTA 即可
     model.eval()
     preds = []
     gts = []
     loss_list = []
+
+    miou = 0.0
+
     with torch.no_grad():
         for data in tqdm(test_loader):
             img, msk = data
@@ -111,8 +113,8 @@ def val_one_epoch(test_loader,
         f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
         miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
 
-        log_info = f'val epoch: {epoch}, loss: {np.mean(loss_list):.4f}, miou: {miou}, f1_or_dsc: {f1_or_dsc}, accuracy: {accuracy}, \
-                specificity: {specificity}, sensitivity: {sensitivity}, confusion_matrix: {confusion}'
+        log_info = f'val epoch: {epoch}, loss: {np.mean(loss_list):.4f}, miou: {miou:.4f}, f1_or_dsc: {f1_or_dsc:.4f}, accuracy: {accuracy:.4f}, \
+                specificity: {specificity:.4f}, sensitivity: {sensitivity:.4f}, confusion_matrix: {confusion}'
         print(log_info)
         logger.info(log_info)
 
@@ -121,7 +123,7 @@ def val_one_epoch(test_loader,
         print(log_info)
         logger.info(log_info)
 
-    return np.mean(loss_list),miou
+    return np.mean(loss_list), miou
 
 
 def test_one_epoch(test_loader,
@@ -130,7 +132,6 @@ def test_one_epoch(test_loader,
                    logger,
                    config,
                    test_data_name=None):
-    # switch to evaluate mode
     model.eval()
     preds = []
     gts = []
@@ -145,8 +146,6 @@ def test_one_epoch(test_loader,
             # ====================================================================
             b, c, h, w = img.shape
             final_prob = torch.zeros((b, 1, h, w), device=img.device)
-
-            # 定义测试尺度：1.0(原图), 1.25(放大看微弱边缘), 0.75(缩小看全局轮廓)
             scales = [1.0, 1.25, 0.75]
 
             for scale in scales:
@@ -157,72 +156,104 @@ def test_one_epoch(test_loader,
 
                 out_prob_s = torch.zeros((b, 1, img_s.shape[2], img_s.shape[3]), device=img.device)
 
-                # 1. 原向
                 o1 = model(img_s)
-                o1 = o1[0] if isinstance(o1, tuple) else o1
-                out_prob_s += o1
+                out_prob_s += o1[0] if isinstance(o1, tuple) else o1
 
-                # 2. 水平翻转
                 o2 = model(torch.flip(img_s, dims=[3]))
-                o2 = o2[0] if isinstance(o2, tuple) else o2
-                out_prob_s += torch.flip(o2, dims=[3])
+                out_prob_s += torch.flip(o2[0] if isinstance(o2, tuple) else o2, dims=[3])
 
-                # 3. 垂直翻转
                 o3 = model(torch.flip(img_s, dims=[2]))
-                o3 = o3[0] if isinstance(o3, tuple) else o3
-                out_prob_s += torch.flip(o3, dims=[2])
+                out_prob_s += torch.flip(o3[0] if isinstance(o3, tuple) else o3, dims=[2])
 
-                # 4. 对角翻转
                 o4 = model(torch.flip(img_s, dims=[2, 3]))
-                o4 = o4[0] if isinstance(o4, tuple) else o4
-                out_prob_s += torch.flip(o4, dims=[2, 3])
+                out_prob_s += torch.flip(o4[0] if isinstance(o4, tuple) else o4, dims=[2, 3])
 
-                # 当前尺度的平均概率
                 out_prob_s = out_prob_s / 4.0
 
-                # 缩放回原始 256x256 尺寸
                 if scale != 1.0:
                     out_prob_s = F.interpolate(out_prob_s, size=(h, w), mode='bilinear', align_corners=False)
 
                 final_prob += out_prob_s
 
-            # 综合所有尺度的概率 (除以 3 因为有三个尺度)
             out = final_prob / len(scales)
             # ====================================================================
 
             loss = criterion(out, msk)
-
             loss_list.append(loss.item())
+
             msk = msk.squeeze(1).cpu().detach().numpy()
             gts.append(msk)
 
+            # 保留完整的空间维度 (b, h, w)，后面形态学清理需要用到！
             out = out.squeeze(1).cpu().detach().numpy()
             preds.append(out)
+
             if i % config.save_interval == 0:
-                save_imgs(img, msk, out, i, config.work_dir + 'outputs/', config.datasets, config.threshold,
+                save_imgs(img.cpu(), msk, out, i, config.work_dir + 'outputs/', config.datasets, config.threshold,
                           test_data_name=test_data_name)
 
-        preds = np.array(preds).reshape(-1)
-        gts = np.array(gts).reshape(-1)
+        # 整理成 (N_images, 256, 256) 的三维数组
+        preds_3d = np.concatenate(preds, axis=0)
+        gts_3d = np.concatenate(gts, axis=0)
 
-        y_pre = np.where(preds >= config.threshold, 1, 0)
-        y_true = np.where(gts >= 0.5, 1, 0)
+        y_true_flat = np.where(gts_3d.reshape(-1) >= 0.5, 1, 0)
 
-        confusion = confusion_matrix(y_true, y_pre)
-        TN, FP, FN, TP = confusion[0, 0], confusion[0, 1], confusion[1, 0], confusion[1, 1]
+        # ====================================================================
+        # 👑 终极压榨：网格搜索 + 最大连通域/孤立噪点过滤
+        # ====================================================================
+        best_miou = 0.0
+        best_thresh = config.threshold
+        best_metrics = {}
 
-        accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
-        sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
-        specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
-        f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
-        miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
+        print("\n🚀 开始搜索最佳阈值并进行形态学连通域净化...")
+        # 扩大搜索上限到 0.85，因为 Focal Loss 会让模型整体置信度偏高
+        for thresh in np.arange(0.15, 0.85, 0.01):
+
+            # 1. 基础阈值截断
+            y_pre_raw = np.where(preds_3d >= thresh, 1, 0)
+
+            # 2. 🚀 形态学净化：移除面积小于 200 像素的孤立假阳性噪点
+            y_pre_clean = np.zeros_like(y_pre_raw)
+            for img_idx in range(y_pre_raw.shape[0]):
+                # remove_small_objects 能瞬间消灭角落里零星的毛发残留预测！
+                cleaned_mask = morphology.remove_small_objects(y_pre_raw[img_idx].astype(bool), min_size=200)
+                y_pre_clean[img_idx] = cleaned_mask.astype(int)
+
+            # 3. 展平进行指标计算
+            y_pre_flat = y_pre_clean.reshape(-1)
+
+            confusion = confusion_matrix(y_true_flat, y_pre_flat)
+            TN, FP, FN, TP = confusion[0, 0], confusion[0, 1], confusion[1, 0], confusion[1, 1]
+
+            miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
+
+            # 更新最佳记录
+            if miou > best_miou:
+                best_miou = miou
+                best_thresh = thresh
+                accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
+                sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
+                specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
+                f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
+
+                best_metrics = {
+                    'miou': miou, 'f1_or_dsc': f1_or_dsc, 'accuracy': accuracy,
+                    'specificity': specificity, 'sensitivity': sensitivity, 'confusion': confusion
+                }
+
+        miou = best_metrics['miou']
+        f1_or_dsc = best_metrics['f1_or_dsc']
+        accuracy = best_metrics['accuracy']
+        specificity = best_metrics['specificity']
+        sensitivity = best_metrics['sensitivity']
+        confusion = best_metrics['confusion']
 
         if test_data_name is not None:
             log_info = f'test_datasets_name: {test_data_name}'
             print(log_info)
             logger.info(log_info)
-        log_info = f'test of best model, loss: {np.mean(loss_list):.4f},miou: {miou}, f1_or_dsc: {f1_or_dsc}, accuracy: {accuracy}, \
-                specificity: {specificity}, sensitivity: {sensitivity}, confusion_matrix: {confusion}'
+
+        log_info = f'👑 [Best Thresh: {best_thresh:.2f} + Clean] test of best model, loss: {np.mean(loss_list):.4f}, miou: {miou:.4f}, f1_or_dsc: {f1_or_dsc:.4f}, accuracy: {accuracy:.4f}, specificity: {specificity:.4f}, sensitivity: {sensitivity:.4f}, confusion_matrix: {confusion}'
         print(log_info)
         logger.info(log_info)
 

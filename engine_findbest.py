@@ -121,7 +121,7 @@ def val_one_epoch(test_loader,
         print(log_info)
         logger.info(log_info)
 
-    return np.mean(loss_list)
+    return np.mean(loss_list),miou
 
 
 def test_one_epoch(test_loader,

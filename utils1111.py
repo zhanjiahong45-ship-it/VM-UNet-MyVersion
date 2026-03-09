@@ -10,7 +10,6 @@ import random
 import logging
 import logging.handlers
 from matplotlib import pyplot as plt
-import cv2  # <--- 新增：用于最大连通域计算的 OpenCV 库
 
 from scipy.ndimage import zoom
 import SimpleITK as sitk
@@ -378,6 +377,65 @@ class BceDiceLoss(nn.Module):
         return loss
 
 
+# ==============================================================================
+# ======================== 新增的 Focal Tversky Loss 模块 ========================
+# ==============================================================================
+
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, gamma=0.75, smooth=1.0):
+        super(FocalTverskyLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = 1 - alpha
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, y_pred, y_true):
+        # 获取 batch_size
+        size = y_pred.size(0)
+
+        # 展平单张图片的像素，保留 batch 维度: shape 变为 (batch_size, H*W)
+        y_pred_pos = y_pred.view(size, -1)
+        y_true_pos = y_true.view(size, -1)
+
+        # 沿着维度 1 (单张图片内部) 进行求和
+        true_pos = (y_true_pos * y_pred_pos).sum(1)
+        false_neg = (y_true_pos * (1 - y_pred_pos)).sum(1)
+        false_pos = ((1 - y_true_pos) * y_pred_pos).sum(1)
+
+        # 计算单张图片的 Tversky Index
+        tversky_index = (true_pos + self.smooth) / (
+                    true_pos + self.alpha * false_neg + self.beta * false_pos + self.smooth)
+
+        # 计算单张图片的 Focal Tversky Loss
+        loss = torch.pow((1 - tversky_index), self.gamma)
+
+        # 最后对整个 batch 取平均，完全对齐你原来的 DiceLoss 逻辑
+        return loss.sum() / size
+
+
+class BceFocalTverskyLoss(nn.Module):
+    """
+    组合 Loss: BCE + Focal Tversky Loss.
+    BCE 用于初期稳定提供像素级分类梯度，FTL 用于后期强攻极难的小病灶。
+    """
+
+    def __init__(self, wb=1.0, wt=1.0, alpha=0.7, gamma=0.75):
+        super(BceFocalTverskyLoss, self).__init__()
+        self.bce = BCELoss()  # 复用上面已经定义好的能自动拉平张量的 BCELoss
+        self.ftl = FocalTverskyLoss(alpha=alpha, gamma=gamma)
+        self.wb = wb
+        self.wt = wt
+
+    def forward(self, pred, target):
+        bce_loss = self.bce(pred, target)
+        ftl_loss = self.ftl(pred, target)
+        return self.wb * bce_loss + self.wt * ftl_loss
+
+
+# ==============================================================================
+# ==============================================================================
+
+
 class GT_BceDiceLoss(nn.Module):
     def __init__(self, wb=1, wd=1):
         super(GT_BceDiceLoss, self).__init__()
@@ -551,47 +609,3 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256],
         sitk.WriteImage(lab_itk, test_save_path + '/' + case + "_gt.nii.gz")
         # cv2.imwrite(test_save_path + '/'+case + '.png', prediction*255)
     return metric_list
-
-
-# =========================================================================
-# 新增的连通域后处理模块 (Largest Connected Component)
-# =========================================================================
-def keep_largest_connected_component(mask):
-    """
-    提取单个 2D mask (H, W) 的最大连通域。用于滤除微小的假阳性噪声。
-    """
-    mask_np = mask.astype(np.uint8)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
-
-    # 如果只有背景 (num_labels=1) 或者完全为空
-    if num_labels <= 1:
-        return mask_np
-
-    # 找到除背景(标签0)外，面积最大的连通域索引
-    # stats[:, cv2.CC_STAT_AREA] 是各连通域的面积，[1:] 去掉背景面积
-    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-
-    cleaned_mask = np.zeros_like(mask_np)
-    cleaned_mask[labels == largest_label] = 1
-    return cleaned_mask
-
-
-def batch_keep_largest_connected_component(preds_tensor):
-    """
-    处理 PyTorch Tensor 的 Batch: 形状为 (B, 1, H, W) 或 (B, H, W)
-    """
-    # 1. 保存输入所在的设备 (GPU)，将其移至 CPU 并转为 numpy 处理
-    device = preds_tensor.device
-    preds_np = preds_tensor.detach().cpu().numpy()
-
-    # 2. 根据 Tensor 的维度，按 Batch 逐张图片进行 LCC 过滤
-    if len(preds_np.shape) == 4:  # 对应形状 (B, 1, H, W) 或 (B, C, H, W)
-        for b in range(preds_np.shape[0]):
-            preds_np[b, 0] = keep_largest_connected_component(preds_np[b, 0])
-    elif len(preds_np.shape) == 3:  # 对应形状 (B, H, W)
-        for b in range(preds_np.shape[0]):
-            preds_np[b] = keep_largest_connected_component(preds_np[b])
-
-    # 3. 重新转回原设备上的 Tensor 并返回
-    cleaned_preds_tensor = torch.from_numpy(preds_np).to(device)
-    return cleaned_preds_tensor
