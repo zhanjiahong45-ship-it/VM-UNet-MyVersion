@@ -10,7 +10,6 @@ import random
 import logging
 import logging.handlers
 from matplotlib import pyplot as plt
-import cv2  # <--- 新增：用于最大连通域计算的 OpenCV 库
 
 from scipy.ndimage import zoom
 import SimpleITK as sitk
@@ -215,7 +214,7 @@ def get_scheduler(config, optimizer):
         )
     elif config.sch == 'WP_MultiStepLR':
         lr_func = lambda \
-                epoch: epoch / config.warm_up_epochs if epoch <= config.warm_up_epochs else config.gamma ** len(
+            epoch: epoch / config.warm_up_epochs if epoch <= config.warm_up_epochs else config.gamma ** len(
             [m for m in config.milestones if m <= epoch])
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
     elif config.sch == 'WP_CosineLR':
@@ -376,6 +375,45 @@ class BceDiceLoss(nn.Module):
 
         loss = self.wd * diceloss + self.wb * bceloss
         return loss
+
+
+class TverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1e-5):
+        super(TverskyLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred = pred.view(-1)
+        target = target.view(-1)
+
+        # True Positives, False Positives, False Negatives
+        TP = (pred * target).sum()
+        FP = ((1 - target) * pred).sum()
+        FN = (target * (1 - pred)).sum()
+
+        # Tversky 公式：分母中 FN 乘以 alpha，FP 乘以 beta
+        Tversky = (TP + self.smooth) / (TP + self.alpha * FN + self.beta * FP + self.smooth)
+        return 1 - Tversky
+
+
+class BceTverskyLoss(nn.Module):
+    def __init__(self, alpha=0.7, beta=0.3, wb=1, wt=1):
+        super(BceTverskyLoss, self).__init__()
+        # 复用你 utils.py 中已经写好的 BCELoss
+        self.bce = BCELoss()
+        self.tversky = TverskyLoss(alpha=alpha, beta=beta)
+        self.wb = wb
+        self.wt = wt
+
+    def forward(self, pred, target):
+        bceloss = self.bce(pred, target)
+        tverskyloss = self.tversky(pred, target)
+
+        loss = self.wb * bceloss + self.wt * tverskyloss
+        return loss
+
 
 
 class GT_BceDiceLoss(nn.Module):
@@ -553,45 +591,166 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256],
     return metric_list
 
 
-# =========================================================================
-# 新增的连通域后处理模块 (Largest Connected Component)
-# =========================================================================
-def keep_largest_connected_component(mask):
+class FocalLoss(nn.Module):
     """
-    提取单个 2D mask (H, W) 的最大连通域。用于滤除微小的假阳性噪声。
+    针对困难样本（浅色病灶）的 Focal Loss。
+    核心逻辑：网络越分不对的像素，惩罚权重呈指数级放大；已经分对的深色病灶，惩罚权重降到极低。
     """
-    mask_np = mask.astype(np.uint8)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
 
-    # 如果只有背景 (num_labels=1) 或者完全为空
-    if num_labels <= 1:
-        return mask_np
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', smooth=1e-5):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.smooth = smooth
 
-    # 找到除背景(标签0)外，面积最大的连通域索引
-    # stats[:, cv2.CC_STAT_AREA] 是各连通域的面积，[1:] 去掉背景面积
-    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    def forward(self, pred, target):
+        size = pred.size(0)
+        # 展平以便计算
+        pred_ = pred.view(size, -1)
+        target_ = target.view(size, -1)
 
-    cleaned_mask = np.zeros_like(mask_np)
-    cleaned_mask[labels == largest_label] = 1
-    return cleaned_mask
+        # 【极其关键】：因为 VMUNet 输出已经过了 sigmoid，存在绝对的 0 或 1，
+        # 直接求 log 会导致梯度爆炸 (NaN)。必须用 clamp 截断在极小值范围。
+        pred_ = torch.clamp(pred_, min=self.smooth, max=1.0 - self.smooth)
+
+        # 计算预测正确的概率 pt
+        # 如果 target==1，pt = pred_；如果 target==0，pt = 1 - pred_
+        pt = torch.where(target_ == 1, pred_, 1 - pred_)
+
+        # 计算基础的交叉熵 CE = -log(pt)
+        bce_loss = -torch.log(pt)
+
+        # 引入类别平衡权重 alpha
+        alpha_t = torch.where(target_ == 1, self.alpha, 1 - self.alpha)
+
+        # 核心公式：FL = alpha_t * (1 - pt)^gamma * CE
+        # 浅色病灶 (预测概率低，pt小) 的权重 (1-pt)^gamma 会接近 1，Loss 被完整保留
+        # 深色病灶 (预测概率高，pt接近1) 的权重 (1-pt)^gamma 会趋近 0，不再产生干扰梯度
+        focal_loss = alpha_t * ((1 - pt) ** self.gamma) * bce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        else:
+            return focal_loss.sum()
 
 
-def batch_keep_largest_connected_component(preds_tensor):
+class FocalDiceLoss(nn.Module):
     """
-    处理 PyTorch Tensor 的 Batch: 形状为 (B, 1, H, W) 或 (B, H, W)
+    终极组合损失函数：
+    Focal Loss 负责逼迫网络抠出浅色微弱边界；
+    Dice Loss 负责保证病灶区域的整体连贯性。
     """
-    # 1. 保存输入所在的设备 (GPU)，将其移至 CPU 并转为 numpy 处理
-    device = preds_tensor.device
-    preds_np = preds_tensor.detach().cpu().numpy()
 
-    # 2. 根据 Tensor 的维度，按 Batch 逐张图片进行 LCC 过滤
-    if len(preds_np.shape) == 4:  # 对应形状 (B, 1, H, W) 或 (B, C, H, W)
-        for b in range(preds_np.shape[0]):
-            preds_np[b, 0] = keep_largest_connected_component(preds_np[b, 0])
-    elif len(preds_np.shape) == 3:  # 对应形状 (B, H, W)
-        for b in range(preds_np.shape[0]):
-            preds_np[b] = keep_largest_connected_component(preds_np[b])
+    def __init__(self, alpha=0.25, gamma=2.0, wf=1, wd=1):
+        super(FocalDiceLoss, self).__init__()
+        self.focal = FocalLoss(alpha=alpha, gamma=gamma)
+        # 复用原有的 DiceLoss
+        self.dice = DiceLoss()
+        self.wf = wf
+        self.wd = wd
 
-    # 3. 重新转回原设备上的 Tensor 并返回
-    cleaned_preds_tensor = torch.from_numpy(preds_np).to(device)
-    return cleaned_preds_tensor
+    def forward(self, pred, target):
+        focalloss = self.focal(pred, target)
+        diceloss = self.dice(pred, target)
+
+        # 结合困难样本挖掘与区域连贯性
+        loss = self.wf * focalloss + self.wd * diceloss
+        return loss
+class RobustCompoundLoss(nn.Module):
+    """
+    Three-component loss designed to simultaneously optimize for:
+      1. Overall segmentation quality (FocalDice — your existing loss)
+      2. Difficult sample emphasis (OHEM — online hard example mining)
+      3. Light-lesion boundary recall (PixelConfidencePenalty)
+
+    Usage:
+        criterion = RobustCompoundLoss(alpha=0.75, gamma=2.0)
+    """
+    def __init__(self, alpha=0.75, gamma=2.0, ohem_ratio=0.7, confidence_band=(0.3, 0.7)):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ohem_ratio = ohem_ratio
+        self.low = confidence_band[0]
+        self.high = confidence_band[1]
+
+    def focal_loss_per_pixel(self, pred, target):
+        """Returns per-pixel focal loss (no reduction)"""
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        pt = torch.where(target == 1, pred, 1 - pred)
+        alpha_t = torch.where(target == 1, self.alpha, 1 - self.alpha)
+        focal = alpha_t * ((1 - pt) ** self.gamma) * bce
+        return focal
+
+    def dice_loss(self, pred, target):
+        """Standard batch-level dice loss"""
+        smooth = 1.0
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        return 1 - (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+
+    def forward(self, pred, target):
+        # ── Component 1: Focal loss with OHEM ──
+        focal_per_pixel = self.focal_loss_per_pixel(pred, target)  # (B, 1, H, W)
+
+        # OHEM: keep only the hardest ohem_ratio fraction of pixels
+        focal_flat = focal_per_pixel.view(focal_per_pixel.shape[0], -1)  # (B, H*W)
+        num_pixels = focal_flat.shape[1]
+        k = max(int(self.ohem_ratio * num_pixels), 1)
+
+        # Per-sample topk, then average
+        topk_vals, _ = torch.topk(focal_flat, k, dim=1)
+        focal_ohem = topk_vals.mean()
+
+        # ── Component 2: Dice loss (unchanged, for global overlap) ──
+        dice = self.dice_loss(pred, target)
+
+        # ── Component 3: Confidence-band penalty ──
+        # Penalize pixels where prediction is uncertain (0.3–0.7)
+        # These are precisely the light-colored lesion boundaries the model is unsure about
+        uncertain_mask = ((pred > self.low) & (pred < self.high)).float()
+        # How many uncertain pixels fall on true positives? (= missed light lesions)
+        uncertain_on_positive = uncertain_mask * target
+        # Penalty: push these uncertain-positive pixels toward 1.0
+        if uncertain_on_positive.sum() > 0:
+            confidence_penalty = F.binary_cross_entropy(
+                pred * uncertain_on_positive,
+                target * uncertain_on_positive,
+                reduction='sum'
+            ) / (uncertain_on_positive.sum() + 1e-6)
+        else:
+            confidence_penalty = torch.tensor(0.0, device=pred.device)
+
+        # ── Final weighted combination ──
+        # Weights: Focal-OHEM dominates early, confidence penalty grows with training
+        total = 1.0 * focal_ohem + 1.0 * dice + 0.5 * confidence_penalty
+
+        return total
+
+
+class GentleCompoundLoss(nn.Module):
+    """验证过的 FocalDiceLoss + 轻微的不确定性惩罚"""
+
+    def __init__(self, alpha=0.75, gamma=2.0, confidence_weight=0.1):
+        super().__init__()
+        # 基础损失函数
+        self.base_loss = FocalDiceLoss(alpha=alpha, gamma=gamma, wf=1, wd=1)
+        self.confidence_weight = confidence_weight
+
+    def forward(self, pred, target):
+        base = self.base_loss(pred, target)
+
+        # 对称置信度惩罚：惩罚所有不确定的像素（预测值在 0.3 到 0.7 之间）
+        uncertain_mask = ((pred > 0.3) & (pred < 0.7)).float()
+
+        if uncertain_mask.sum() > 0:
+            penalty = F.binary_cross_entropy(
+                pred, target, reduction='none'
+            )
+            penalty = (penalty * uncertain_mask).sum() / (uncertain_mask.sum() + 1e-6)
+        else:
+            penalty = 0.0
+
+        return base + self.confidence_weight * penalty

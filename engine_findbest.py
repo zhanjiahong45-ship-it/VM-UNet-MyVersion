@@ -219,7 +219,7 @@ def test_one_epoch(test_loader,
 
         print("\n🚀 开始搜索最佳阈值...")
         # 从 0.15 搜到 0.50，步长 0.01
-        for thresh in np.arange(0.15, 0.51, 0.01):
+        for thresh in np.arange(0.15, 0.81, 0.01):
             y_pre = np.where(preds >= thresh, 1, 0)
             confusion = confusion_matrix(y_true, y_pre)
             TN, FP, FN, TP = confusion[0, 0], confusion[0, 1], confusion[1, 0], confusion[1, 1]
