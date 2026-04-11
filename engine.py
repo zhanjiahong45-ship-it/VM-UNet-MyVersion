@@ -6,6 +6,15 @@ from sklearn.metrics import confusion_matrix
 from utils import save_imgs
 
 
+def _inpaint_with_skin(img_tensor, prob, threshold=0.4):
+    """用全图非病灶区域均值皮肤色填充锚点区域，供两遍推理使用。"""
+    anchor = (prob > threshold).float()
+    non_anchor = 1.0 - anchor
+    skin_color = (img_tensor * non_anchor).sum(dim=[2, 3], keepdim=True) / \
+                 (non_anchor.sum(dim=[2, 3], keepdim=True) + 1e-8)
+    return img_tensor * (1 - anchor) + skin_color.expand_as(img_tensor) * anchor
+
+
 def train_one_epoch(train_loader,
                     model,
                     criterion,
@@ -15,13 +24,9 @@ def train_one_epoch(train_loader,
                     step,
                     logger,
                     config,
-                    writer):
-    '''
-    train model for one epoch
-    '''
-    # switch to train mode
+                    writer,
+                    scaler=None): # 👑 补上 scaler 参数
     model.train()
-
     loss_list = []
 
     for iter, data in enumerate(train_loader):
@@ -30,11 +35,22 @@ def train_one_epoch(train_loader,
         images, targets = data
         images, targets = images.cuda(non_blocking=True).float(), targets.cuda(non_blocking=True).float()
 
-        out = model(images)
-        loss = criterion(out, targets)
+        # 👑 加上混合精度上下文
+        with autocast(enabled=config.amp):
+            out = model(images)
 
-        loss.backward()
-        optimizer.step()
+        # 2. 将输出强制转回高精度 FP32，并在 autocast 外部计算 Loss
+        # 这样 BCELoss 接收到的是绝对安全的 Float32 数据，就不会报错了
+        loss = criterion(out.float(), targets.float())
+
+        # 3. 反向传播保持不变
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         loss_list.append(loss.item())
 
@@ -55,12 +71,13 @@ def train_one_epoch(train_loader,
     return step
 
 
-def val_one_epoch(test_loader,
+def val_one_epoch(val_loader,  # 👑 名字改为 val_loader
                   model,
                   criterion,
                   epoch,
                   logger,
-                  config):
+                  config,
+                  writer=None):  # 👑 补上 writer 参数
     model.eval()
     preds = []
     gts = []
@@ -70,7 +87,7 @@ def val_one_epoch(test_loader,
     miou = 0.0
 
     with torch.no_grad():
-        for data in tqdm(test_loader):
+        for data in tqdm(val_loader):  # 👑 这里也要同步改成 val_loader
             img, msk = data
             img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
 
@@ -106,6 +123,11 @@ def val_one_epoch(test_loader,
         print(log_info)
         logger.info(log_info)
 
+        # 如果传入了 writer，顺便记录一下验证集的指标
+        if writer is not None:
+            writer.add_scalar('val/loss', np.mean(loss_list), global_step=epoch)
+            writer.add_scalar('val/miou', miou, global_step=epoch)
+
     else:
         log_info = f'val epoch: {epoch}, loss: {np.mean(loss_list):.4f}'
         print(log_info)
@@ -131,9 +153,15 @@ def test_one_epoch(test_loader,
             img, msk = data
             img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
 
-            # 【已精简】：彻底删除 12 视角多尺度 TTA 循环
             out = model(img)
             out = out[0] if isinstance(out, tuple) else out
+
+            # 两遍精炼：稀疏高置信 = 浅色病灶，触发补色后第二遍
+            if out.max() > 0.5 and out.mean() < 0.05:
+                img2 = _inpaint_with_skin(img, out)
+                out2 = model(img2)
+                out2 = out2[0] if isinstance(out2, tuple) else out2
+                out = torch.max(out, out2)
 
             loss = criterion(out, msk)
             loss_list.append(loss.item())

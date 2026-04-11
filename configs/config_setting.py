@@ -27,7 +27,9 @@ class setting_config:
     else:
         raise Exception('datasets in not right!')
 
-    criterion = GentleCompoundLoss(alpha=0.75, gamma=2.0, confidence_weight=0.1)
+        # 👑 替换掉原有的 BceDiceLoss
+        # 换上专治“漏检”的非对称 Loss，强迫模型去抓模糊边界
+    criterion = BceDiceLoss(wb=1, wd=1)
 
     pretrained_path = './pre_trained/'
     num_classes = 1
@@ -36,7 +38,7 @@ class setting_config:
     input_channels = 3
     distributed = False
     local_rank = -1
-    num_workers = 4
+    num_workers = 16
     seed = 42
     world_size = None
     rank = None
@@ -45,18 +47,7 @@ class setting_config:
     batch_size = 32
 
     # 👑 回调 2：设定为 120 轮。前 60 轮冲刺，后 60 轮在低学习率下精细沉降
-    stage1_epochs = 80  # Stage 1: full model training
-    stage2_epochs = 40  # Stage 2: decoder-focused refinement
-    epochs = 120  # total (must equal stage1 + stage2)
-
-    # Stage 2 LR (10x lower than stage 1 peak)
-    stage2_lr = 2e-5
-
-    # ── Sentinel Metric Config (Part 4) ──
-    # Paths to the 3 author-identified hard cases (place in /root/root/VM-UNet/sentinel/)
-    sentinel_dir = '/root/root/VM-UNet/sentinel'
-    # These are the ground truth masks for the 3 sentinel images
-    sentinel_gt_dir = '/root/root/VM-UNet/sentinel_gt'
+    epochs = 120
 
     work_dir = 'results/' + network + '_' + datasets + '_' + datetime.now().strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
 
@@ -89,7 +80,8 @@ class setting_config:
                    'SGD'], 'Unsupported optimizer!'
 
     if opt == 'AdamW':
-        # 👑 回调 3：恢复 2e-4，给足模型冲刺 83 分的动力
+        # 2. Batch Size 是原来的 2 倍 (32 -> 64)
+        # 学习率也要相应调整，推荐使用 4e-4 (即原来 2e-4 的两倍)
         lr = 2e-4
         betas = (0.9, 0.999)
         eps = 1e-8
@@ -102,5 +94,5 @@ class setting_config:
         warm_up_epochs = 10
         # 👑 核心绝杀：T_max 对齐 120。
         # 这样在第 60 轮（之前容易过拟合的拐点），学习率刚好衰减到一半，强行按住模型不让它乱飞。
-        T_max = 80
+        T_max = 120
         eta_min = 1e-6

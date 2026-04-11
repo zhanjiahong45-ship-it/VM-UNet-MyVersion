@@ -1,403 +1,285 @@
 import torch
 from torch.utils.data import DataLoader
-from datasets.dataset import NPY_datasets
 from tensorboardX import SummaryWriter
-# 更改此处：从新的 vmunetff 导入模型
-from models.vmunet.vmunetff import VMUNet
-
-from engine import *
 import os
 import sys
-import cv2
 import numpy as np
+import warnings
 from PIL import Image
+from models.vmunet.vmunetff import VMUNet
+from datasets.dataset import NPY_datasets
+from engine import train_one_epoch, val_one_epoch
 from utils import *
 from configs.config_setting import setting_config
 
-import warnings
-from utils import RobustCompoundLoss
 warnings.filterwarnings("ignore")
 
 
-def track_hard_samples(model, epoch, config, device):
-    """
-    困难样本动态追踪器：自动读取 inputs 文件夹下的图，输出预测叠加图
-    """
-    model.eval()  # 确保切到预测模式
+def inpaint_with_skin(img_tensor, prob, threshold=0.4):
+    anchor = (prob > threshold).float()
+    non_anchor = 1.0 - anchor
+    skin_color = (img_tensor * non_anchor).sum(dim=[2, 3], keepdim=True) / \
+                 (non_anchor.sum(dim=[2, 3], keepdim=True) + 1e-8)
+    return img_tensor * (1 - anchor) + skin_color.expand_as(img_tensor) * anchor
 
-    # 自动读取该目录下所有的图片文件
-    input_dir = '/root/root/VM-UNet/inputs'
+
+def build_model(config, device):
+    m = VMUNet(
+        num_classes=config.num_classes,
+        input_channels=config.input_channels,
+        depths=config.model_config['depths'],
+        depths_decoder=config.model_config['depths_decoder'],
+        drop_path_rate=config.model_config['drop_path_rate'],
+        load_ckpt_path=None,
+    ).to(device)
+    return m
+
+
+def select_best_early_model(ckpt_paths, config, device):
+    """
+    从 epoch2/3/4 权重中选出对浅色病灶最慷慨的模型。
+    评估方式：对训练集前20张图做 ghost 增强，比较各模型在 GT 正样本区域的平均概率。
+    """
+    from utils import myFaintLesionAugmentor
+    augmentor = myFaintLesionAugmentor()
+
+    # 取训练集前20张图
+    train_images_dir = os.path.join(config.data_path, 'train/images/')
+    train_masks_dir = os.path.join(config.data_path, 'train/masks/')
+    img_names = sorted(os.listdir(train_images_dir))[:20]
+
+    best_score = -1.0
+    best_path = ckpt_paths[0]
+
+    for ckpt_path in ckpt_paths:
+        if not os.path.exists(ckpt_path):
+            continue
+        model = build_model(config, device)
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.eval()
+
+        scores = []
+        with torch.no_grad():
+            for name in img_names:
+                img = np.array(Image.open(os.path.join(train_images_dir, name)).convert('RGB'))
+                msk = np.array(Image.open(os.path.join(train_masks_dir, name)).convert('L'))
+                msk = np.expand_dims(msk, -1)
+                msk_bin = (msk > 127).astype(np.float32)
+
+                # ghost 增强
+                img_faint, _ = augmentor.apply_specific_mode((img, msk_bin), mode='ghost')
+
+                dummy_mask = np.zeros((config.input_size_h, config.input_size_w, 1), dtype=np.float32)
+                img_t, _ = config.test_transformer((img_faint, dummy_mask))
+                img_t = img_t.unsqueeze(0).float().to(device)
+
+                out = model(img_t)
+                out = out[0] if isinstance(out, tuple) else out
+
+                # GT 正样本区域平均概率
+                msk_t, _ = config.test_transformer((img, msk_bin))
+                gt = (msk_t > 0.5).float().to(device)
+                if gt.sum() > 0:
+                    scores.append((out * gt).sum().item() / gt.sum().item())
+
+        score = np.mean(scores) if scores else 0.0
+        print(f"  Early model {os.path.basename(ckpt_path)}: faint_score={score:.4f}")
+        if score > best_score:
+            best_score = score
+            best_path = ckpt_path
+
+    print(f"  Selected: {os.path.basename(best_path)} (score={best_score:.4f})")
+    return best_path
+
+
+def track_hard_samples(model, epoch, config, device, early_model=None):
+    model.eval()
+
+    input_dir = getattr(config, 'hard_samples_input_dir', './inputs/')
     if not os.path.exists(input_dir):
-        print(f"⚠️ 找不到文件夹: {input_dir}")
         return
 
-    hard_sample_paths = [os.path.join(input_dir, img) for img in os.listdir(input_dir)
-                         if img.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-    if len(hard_sample_paths) == 0:
+    hard_sample_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir)
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if not hard_sample_paths:
         return
 
-    # 自动在当前训练的 result 文件夹下建一个 tracking 目录
     tracking_dir = os.path.join(config.work_dir, 'hard_samples_tracking')
     os.makedirs(tracking_dir, exist_ok=True)
-
-    # 你的 ISIC18 预处理参数
-    ISIC18_TEST_MEAN = 149.034
-    ISIC18_TEST_STD = 32.022
-    IMG_SIZE = 256
-    THRESHOLD = 0.5
 
     with torch.no_grad():
         for img_path in hard_sample_paths:
             img_name = os.path.basename(img_path)
-            img_pil = Image.open(img_path).convert('RGB')
-            original_size = img_pil.size
+            original_img = Image.open(img_path).convert('RGB')
+            original_img = original_img.resize((config.input_size_w, config.input_size_h))
+            img_np = np.array(original_img)
+            dummy_mask = np.zeros((config.input_size_h, config.input_size_w, 1), dtype=np.float32)
+            img_tensor, _ = config.test_transformer((img_np, dummy_mask))
+            img_tensor = img_tensor.unsqueeze(0).float().to(device)
 
-            # 完全复刻预处理逻辑
-            img_resized = img_pil.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-            img_arr = np.array(img_resized, dtype=np.float32)
-            img_normalized = (img_arr - ISIC18_TEST_MEAN) / ISIC18_TEST_STD
-            img_min, img_max = np.min(img_normalized), np.max(img_normalized)
-            if img_max > img_min:
-                img_final = ((img_normalized - img_min) / (img_max - img_min)) * 255.0
+            # 最终模型第一遍
+            out_final = model(img_tensor)
+            out_final = out_final[0] if isinstance(out_final, tuple) else out_final
+            prob_max = out_final.max().item()
+            prob_mean = out_final.mean().item()
+
+            is_faint = prob_max > 0.5 and prob_mean < 0.05
+            print(f"  [{img_name}] max={prob_max:.3f} mean={prob_mean:.4f} faint={is_faint}")
+
+            # 面板数量取决于是否有早期模型且触发浅色病灶
+            if early_model is not None and is_faint:
+                fig, axes = plt.subplots(1, 7, figsize=(35, 5))
+
+                def to_np_img(t):
+                    arr = t.squeeze().permute(1, 2, 0).cpu().numpy()
+                    return np.clip(arr, 0, 1)
+
+                # 1. 原图
+                axes[0].imshow(img_np); axes[0].set_title("1.Original"); axes[0].axis('off')
+
+                # 2. best模型切原图 → Mask-m
+                mask_m = out_final
+                axes[1].imshow(mask_m.squeeze().cpu().numpy(), cmap='jet')
+                axes[1].set_title(f"2.Mask-m(best)\nmax={mask_m.max().item():.2f}"); axes[1].axis('off')
+
+                # 3. 早期模型切原图 → Mask-e
+                early_model.eval()
+                out_e = early_model(img_tensor)
+                out_e = out_e[0] if isinstance(out_e, tuple) else out_e
+                mask_e = out_e
+                axes[2].imshow(mask_e.squeeze().cpu().numpy(), cmap='jet')
+                axes[2].set_title(f"3.Mask-e(early)\nmax={mask_e.max().item():.2f}"); axes[2].axis('off')
+
+                # 4. 用Mask-m补色 → m1
+                img_m1 = inpaint_with_skin(img_tensor, mask_m, threshold=0.4)
+                axes[3].imshow(to_np_img(img_m1)); axes[3].set_title("4.m1(inpaint by m)"); axes[3].axis('off')
+
+                # 5. 用Mask-e补色 → me
+                img_me = inpaint_with_skin(img_tensor, mask_e, threshold=0.4)
+                axes[4].imshow(to_np_img(img_me)); axes[4].set_title("5.me(inpaint by e)"); axes[4].axis('off')
+
+                # 6. m1跑早期模型
+                out_m1 = early_model(img_m1)
+                out_m1 = out_m1[0] if isinstance(out_m1, tuple) else out_m1
+                axes[5].imshow(out_m1.squeeze().cpu().numpy(), cmap='jet')
+                axes[5].set_title(f"6.early(m1)\nmax={out_m1.max().item():.2f}"); axes[5].axis('off')
+
+                # 7. me跑早期模型
+                out_me = early_model(img_me)
+                out_me = out_me[0] if isinstance(out_me, tuple) else out_me
+                axes[6].imshow(out_me.squeeze().cpu().numpy(), cmap='jet')
+                axes[6].set_title(f"7.early(me)\nmax={out_me.max().item():.2f}"); axes[6].axis('off')
+
             else:
-                img_final = img_normalized
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                axes[0].imshow(img_np); axes[0].set_title("Original"); axes[0].axis('off')
+                prob_f = out_final.squeeze().cpu().numpy()
+                axes[1].imshow(prob_f, cmap='jet')
+                axes[1].set_title(f"Ep{epoch} max={prob_max:.2f} mean={prob_mean:.3f}")
+                axes[1].axis('off')
+                axes[2].imshow(img_np); axes[2].imshow(prob_f, cmap='jet', alpha=0.5)
+                axes[2].set_title("Overlay"); axes[2].axis('off')
 
-            img_tensor = torch.from_numpy(img_final).permute(2, 0, 1).contiguous().float()
-            img_tensor = img_tensor.unsqueeze(0).to(device)
+            save_path = os.path.join(tracking_dir, f"epoch_{epoch:03d}_{img_name}")
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
 
-            # 推理
-            output = model(img_tensor)
-            if isinstance(output, tuple):
-                output = output[0]
 
-            # 后处理与 Overlay 叠加
-            prob_map = output.squeeze().cpu().numpy()
-            prob_map_resized = cv2.resize(prob_map, original_size, interpolation=cv2.INTER_LINEAR)
-            prediction = (prob_map_resized > THRESHOLD).astype(np.uint8) * 255
-
-            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-            color_mask = np.zeros_like(img_cv)
-            color_mask[prediction == 255] = [0, 0, 255]
-            overlay = cv2.addWeighted(img_cv, 0.7, color_mask, 0.5, 0)
-
-            contours, _ = cv2.findContours(prediction, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
-
-            # 保存图片：带有 epoch 序号
-            save_path = os.path.join(tracking_dir, f'epoch_{epoch:03d}_{img_name}')
-            cv2.imwrite(save_path, overlay)
-def evaluate_sentinel_images(model, config, epoch):
-    """
-    Compute per-pixel IoU on the 3 author-identified hard cases.
-    These images are stored as:
-      sentinel/   → input images  (e.g., light_lesion_1.png)
-      sentinel_gt/ → binary masks (e.g., light_lesion_1.png, white=lesion)
-
-    Returns: mean IoU across the sentinel set (float, 0~1)
-    """
-    model.eval()
-
-    sentinel_dir = getattr(config, 'sentinel_dir', None)
-    sentinel_gt_dir = getattr(config, 'sentinel_gt_dir', None)
-
-    if sentinel_dir is None or not os.path.exists(sentinel_dir):
-        return 0.0
-
-    ISIC18_TEST_MEAN = 149.034
-    ISIC18_TEST_STD = 32.022
-    IMG_SIZE = 256
-    THRESHOLD = 0.5
-
-    ious = []
-
-    with torch.no_grad():
-        for img_name in sorted(os.listdir(sentinel_dir)):
-            if not img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                continue
-
-            # Load and preprocess image (same as your track_hard_samples)
-            img_path = os.path.join(sentinel_dir, img_name)
-            img_pil = Image.open(img_path).convert('RGB')
-            img_resized = img_pil.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-            img_arr = np.array(img_resized, dtype=np.float32)
-            img_normalized = (img_arr - ISIC18_TEST_MEAN) / ISIC18_TEST_STD
-            img_min, img_max = np.min(img_normalized), np.max(img_normalized)
-            if img_max > img_min:
-                img_final = ((img_normalized - img_min) / (img_max - img_min)) * 255.0
-            else:
-                img_final = img_normalized
-
-            img_tensor = torch.from_numpy(img_final).permute(2, 0, 1).contiguous().float()
-            img_tensor = img_tensor.unsqueeze(0).cuda()
-
-            # Inference
-            output = model(img_tensor)
-            if isinstance(output, tuple):
-                output = output[0]
-            pred = (output.squeeze().cpu().numpy() > THRESHOLD).astype(np.uint8)
-
-            # Load ground truth
-            gt_path = os.path.join(sentinel_gt_dir, img_name)
-            if not os.path.exists(gt_path):
-                # Try matching without extension
-                base = os.path.splitext(img_name)[0]
-                for ext in ['.png', '.jpg', '.bmp']:
-                    candidate = os.path.join(sentinel_gt_dir, base + ext)
-                    if os.path.exists(candidate):
-                        gt_path = candidate
-                        break
-
-            if not os.path.exists(gt_path):
-                continue
-
-            gt_pil = Image.open(gt_path).convert('L')
-            gt_resized = gt_pil.resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)
-            gt = (np.array(gt_resized) > 127).astype(np.uint8)
-
-            # Compute IoU
-            intersection = (pred & gt).sum()
-            union = (pred | gt).sum()
-            iou = intersection / (union + 1e-6)
-            ious.append(iou)
-
-    model.train()
-
-    if len(ious) == 0:
-        return 0.0
-    return float(np.mean(ious))
 def main(config):
     print('#----------Creating logger----------#')
     sys.path.append(config.work_dir + '/')
     log_dir = os.path.join(config.work_dir, 'log')
     checkpoint_dir = os.path.join(config.work_dir, 'checkpoints')
-    resume_model = os.path.join(checkpoint_dir, 'latest.pth')
     outputs = os.path.join(config.work_dir, 'outputs')
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    if not os.path.exists(outputs):
-        os.makedirs(outputs)
+    for d in [checkpoint_dir, outputs]:
+        os.makedirs(d, exist_ok=True)
 
     global logger
     logger = get_logger('train', log_dir)
     global writer
     writer = SummaryWriter(config.work_dir + 'summary')
 
-    log_config_info(config, logger)
-
-    print('#----------GPU init----------#')
     os.environ["CUDA_VISIBLE_DEVICES"] = config.gpu_id
-    set_seed(config.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.cuda.empty_cache()
 
-    print('#----------Preparing dataset----------#')
     train_dataset = NPY_datasets(config.data_path, config, train=True)
-    train_loader = DataLoader(train_dataset,
-                              batch_size=config.batch_size,
-                              shuffle=True,
-                              pin_memory=True,
-                              num_workers=config.num_workers)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size,
+                              shuffle=True, pin_memory=True, num_workers=config.num_workers)
+
     val_dataset = NPY_datasets(config.data_path, config, train=False)
-    val_loader = DataLoader(val_dataset,
-                            batch_size=1,
-                            shuffle=False,
-                            pin_memory=True,
-                            num_workers=config.num_workers,
-                            drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
+                            pin_memory=True, num_workers=config.num_workers, drop_last=True)
 
-    print('#----------Prepareing Model----------#')
-    model_cfg = config.model_config
-    if config.network == 'vmunet':
-        model = VMUNet(
-            num_classes=model_cfg['num_classes'],
-            input_channels=model_cfg['input_channels'],
-            depths=model_cfg['depths'],
-            depths_decoder=model_cfg['depths_decoder'],
-            drop_path_rate=model_cfg['drop_path_rate'],
-            load_ckpt_path=model_cfg['load_ckpt_path'],
-        )
-        model.load_from()
+    model = VMUNet(
+        num_classes=config.num_classes,
+        input_channels=config.input_channels,
+        depths=config.model_config['depths'],
+        depths_decoder=config.model_config['depths_decoder'],
+        drop_path_rate=config.model_config['drop_path_rate'],
+        load_ckpt_path=config.model_config['load_ckpt_path'],
+    )
+    model.load_from()
+    model = model.to(device)
 
-    else:
-        raise Exception('network in not right!')
-    model = model.cuda()
-
-    cal_params_flops(model, 256, logger)
-
-    print('#----------Prepareing loss, opt, sch and amp----------#')
     criterion = config.criterion
     optimizer = get_optimizer(config, model)
     scheduler = get_scheduler(config, optimizer)
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
-    print('#----------Set other params----------#')
-    # 【核心修改 1】：抛弃 min_loss，改用 max_miou 记录最佳状态
+    scaler = torch.cuda.amp.GradScaler() if config.amp else None
+
     max_miou = 0.0
-    best_loss = 999.0
-    best_epoch = 1
-    start_epoch = 1
-    max_sentinel_score = 0.0  # tracks best score on 3 hard images
-
-    # ... existing resume logic ...
-
-    if config.only_test_and_save_figs:
-        checkpoint = torch.load(config.best_ckpt_path, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint)
-        config.work_dir = config.img_save_path
-        if not os.path.exists(config.work_dir + 'outputs/'):
-            os.makedirs(config.work_dir + 'outputs/')
-        loss = test_one_epoch(
-            val_loader,
-            model,
-            criterion,
-            logger,
-            config,
-        )
-        return
-
-    if os.path.exists(resume_model):
-        print('#----------Resume Model and Other params----------#')
-        checkpoint = torch.load(resume_model, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        saved_epoch = checkpoint['epoch']
-        start_epoch += saved_epoch
-
-        # 【核心修改 2】：适配断点续训，读取 miou 相关信息
-        max_miou = checkpoint.get('max_miou', 0.0)
-        max_sentinel_score = checkpoint.get('max_sentinel_score', 0.0)
-        best_epoch = checkpoint.get('best_epoch', 1)
-        best_loss = checkpoint.get('best_loss', 999.0)
-
-        log_info = f'resuming model from {resume_model}. resume_epoch: {saved_epoch}, max_miou: {max_miou:.4f}, best_epoch: {best_epoch}, loss: {best_loss:.4f}'
-        logger.info(log_info)
-
+    best_epoch = 0
     step = 0
-    print('#----------Training----------#')
-    for epoch in range(start_epoch, config.epochs + 1):
+    early_model = None  # 选出的早期模型，epoch5后赋值
 
+    for epoch in range(1, config.epochs + 1):
         torch.cuda.empty_cache()
 
-        # ╔═══════════════════════════════════════════╗
-        # ║  TWO-STAGE TRANSITION LOGIC (Fix 4)       ║
-        # ╚═══════════════════════════════════════════╝
-        if epoch == config.stage1_epochs + 1:
-            print('=' * 60)
-            print('🔄 ENTERING STAGE 2: Freezing encoder, lowering LR')
-            print('=' * 60)
+        # epoch5：切换到 1N 数据集，loss 保持 BceDiceLoss 不变
+        if epoch == 5:
+            train_dataset.set_phase(2)
+            train_loader = DataLoader(train_dataset, batch_size=config.batch_size,
+                                      shuffle=True, pin_memory=True, num_workers=config.num_workers)
+            logger.info("Phase 2: 切换到 1N 数据集")
 
-            # Freeze the entire encoder (layers) and FCD module
-            for name, param in model.named_parameters():
-                # Freeze: patch_embed (FCD), layers.0-3 (encoder)
-                # Keep trainable: layers_up (decoder), respaths, final_*
-                if 'patch_embed' in name or 'layers.' in name:
-                    # Careful: 'layers.' matches encoder, 'layers_up.' matches decoder
-                    # We need to NOT freeze 'layers_up'
-                    if 'layers_up' not in name:
-                        param.requires_grad = False
+            # 选出最佳早期模型
+            early_ckpts = [os.path.join(checkpoint_dir, f'epoch_{i:03d}.pth') for i in [2, 3, 4]]
+            best_early_path = select_best_early_model(early_ckpts, config, device)
+            early_model = build_model(config, device)
+            early_model.load_state_dict(torch.load(best_early_path, map_location=device))
+            early_model.eval()
+            logger.info(f"早期模型已选定: {best_early_path}")
 
-            # Rebuild optimizer with only trainable params + lower LR
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=config.stage2_lr,
-                betas=(0.9, 0.999),
-                weight_decay=0.05
-            )
-            # New cosine scheduler for Stage 2
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=config.stage2_epochs,
-                eta_min=1e-7
-            )
-
-            logger.info(f'Stage 2: {sum(p.numel() for p in trainable_params)} trainable params')
-
-        step = train_one_epoch(
-            train_loader, model, criterion, optimizer, scheduler,
-            epoch, step, logger, config, writer,
+        train_loss = train_one_epoch(
+            train_loader=train_loader, model=model, criterion=criterion,
+            optimizer=optimizer, scheduler=scheduler, epoch=epoch,
+            step=step, logger=logger, config=config, writer=writer, scaler=scaler
         )
 
-        val_result = val_one_epoch(
-            val_loader, model, criterion, epoch, logger, config
+        val_loss, current_miou = val_one_epoch(
+            val_loader=val_loader, model=model, criterion=criterion,
+            epoch=epoch, logger=logger, config=config, writer=writer
         )
 
-        if isinstance(val_result, tuple):
-            loss, current_miou = val_result[0], val_result[1]
-        else:
-            loss = val_result
-            current_miou = 0.0
-
-        # ╔═══════════════════════════════════════════╗
-        # ║  DUAL-METRIC MODEL SAVING (Part 4)        ║
-        # ╚═══════════════════════════════════════════╝
-        # Compute sentinel score on the 3 hard images
-        sentinel_score = evaluate_sentinel_images(model, config, epoch)
-
-        # Composite score: weighted blend of mIoU and sentinel performance
-        # sentinel_score is the mean IoU specifically on the 3 hard cases
-        composite_score = 0.7 * current_miou + 0.3 * sentinel_score
-
-        is_best = False
-        if composite_score > max_miou:  # reusing max_miou as max_composite
-            is_best = True
-            max_miou = composite_score
-            best_loss = loss
+        if current_miou > max_miou:
+            max_miou = current_miou
             best_epoch = epoch
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best.pth'))
+            logger.info(f'New best mIoU: {max_miou:.4f} at epoch {epoch}')
 
-        # Also save "best sentinel" independently (for paper figures)
-        if sentinel_score > max_sentinel_score:
-            max_sentinel_score = sentinel_score
-            torch.save(model.state_dict(),
-                       os.path.join(checkpoint_dir, 'best_sentinel.pth'))
-            logger.info(f'💎 New best sentinel: {sentinel_score:.4f} at epoch {epoch}')
+        # 保存 epoch 2/3/4 权重供早期模型选择
+        if 2 <= epoch <= 4:
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch_{epoch:03d}.pth'))
+            logger.info(f'Saved early checkpoint: epoch_{epoch:03d}.pth')
 
-        if is_best:
-            torch.save(model.state_dict(),
-                       os.path.join(checkpoint_dir, 'best.pth'))
+        # epoch5 之后才追踪困难样本
+        if epoch >= 5:
+            try:
+                track_hard_samples(model, epoch, config, device, early_model=early_model)
+            except Exception as e:
+                logger.warning(f"困难样本追踪失败: {e}")
 
-        # ... existing latest.pth save logic ...
-        torch.save({
-            'epoch': epoch,
-            'max_miou': max_miou,
-            'max_sentinel_score': max_sentinel_score,
-            'best_epoch': best_epoch,
-            'best_loss': best_loss,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-        }, os.path.join(checkpoint_dir, 'latest.pth'))
-
-        track_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        track_hard_samples(model, epoch, config, track_device)
-    # In the final testing section of main(), add:
-    # Replace lines 372-389 with:
-    if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
-        print('#----------Testing----------#')
-        best_weight = torch.load(
-            os.path.join(checkpoint_dir, 'best.pth'),
-            map_location=torch.device('cpu')
-        )
-        model.load_state_dict(best_weight)
-        loss = test_one_epoch(
-            val_loader, model, criterion, logger, config,
-        )
-        os.rename(
-            os.path.join(checkpoint_dir, 'best.pth'),
-            os.path.join(checkpoint_dir, f'best-epoch{best_epoch}-miou{max_miou:.4f}.pth')
-        )
-
-    # Sentinel figures (separate checkpoint)
-    if os.path.exists(os.path.join(checkpoint_dir, 'best_sentinel.pth')):
-        print('#----------Generating Paper Figures----------#')
-        sentinel_weight = torch.load(
-            os.path.join(checkpoint_dir, 'best_sentinel.pth'),
-            map_location=torch.device('cpu')
-        )
-        model.load_state_dict(sentinel_weight)
-        track_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        track_hard_samples(model, 9999, config, track_device)
-        logger.info('Paper figures generated from best_sentinel checkpoint')
+    logger.info(f'Training Complete! Best mIoU: {max_miou:.4f} at epoch {best_epoch}')
 
 
 if __name__ == '__main__':

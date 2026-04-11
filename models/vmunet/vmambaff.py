@@ -77,149 +77,10 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     return flops
 
 
-class Adaptive_SASF_v2(nn.Module):
-    """
-    Production-grade SASF with:
-    1. Channel-split multi-dilation (B2): 67% FLOPs reduction
-    2. Fused BN-ReLU before projection for better gradient flow
-    3. Zero-init residual preserved
-    """
-    def __init__(self, dim, resolution):
-        super().__init__()
-
-        if resolution >= 32:
-            dilations = (1, 3, 5)
-        elif resolution == 16:
-            dilations = (1, 2, 4)
-        else:
-            dilations = (1, 2, 3)
-
-        # Channel-split sizes (handle non-divisible-by-3)
-        g = dim // 3
-        self.group_sizes = [g, g, dim - 2 * g]
-
-        self.dwconvs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(gs, gs, kernel_size=3,
-                          padding=d, dilation=d, groups=gs, bias=False),
-                nn.BatchNorm2d(gs),
-                nn.ReLU(inplace=True)
-            )
-            for gs, d in zip(self.group_sizes, dilations)
-        ])
-
-        # Projection with zero-init
-        self.proj = nn.Conv2d(dim, dim, kernel_size=1)
-        nn.init.constant_(self.proj.weight, 0)
-        nn.init.constant_(self.proj.bias, 0)
-
-    def forward(self, x_2d):
-        groups = torch.split(x_2d, self.group_sizes, dim=1)
-        outs = [conv(g) for conv, g in zip(self.dwconvs, groups)]
-        out = self.proj(torch.cat(outs, dim=1))
-        return x_2d + out
-# ==========================================
-# 👑 创新模块：自适应残差语义桥接路径 (ResPath)
-# 解决 Encoder(浅层) 与 Decoder(深层) 的语义鸿沟
-# ==========================================
-# ==========================================
-# 👑 创新模块：轻量化残差语义桥接路径 (Lightweight ResPath)
-# 采用深度可分离卷积，完美解决高维通道下的参数暴增问题
-# ==========================================
-class LightConv2d_batchnorm(torch.nn.Module):
-    def __init__(self, num_in_filters, num_out_filters, kernel_size, stride=(1, 1), activation='relu'):
-        super().__init__()
-        self.activation = activation
-
-        # 判断如果是 1x1 卷积 (Shortcut使用)，直接用常规卷积
-        if kernel_size == 1 or kernel_size == (1, 1):
-            self.conv = torch.nn.Conv2d(in_channels=num_in_filters, out_channels=num_out_filters,
-                                        kernel_size=1, stride=stride)
-        else:
-            # 如果是 3x3 卷积 (主干使用)，采用深度可分离卷积 (Depthwise Separable Conv)
-            padding = (kernel_size[0] // 2, kernel_size[1] // 2) if isinstance(kernel_size, tuple) else kernel_size // 2
-            self.conv = torch.nn.Sequential(
-                # 第一步：Depthwise 空间提取 (groups=in_channels)，参数量极低
-                torch.nn.Conv2d(in_channels=num_in_filters, out_channels=num_in_filters,
-                                kernel_size=kernel_size, stride=stride, padding=padding, groups=num_in_filters),
-                # 第二步：Pointwise 跨通道融合
-                torch.nn.Conv2d(in_channels=num_in_filters, out_channels=num_out_filters, kernel_size=1)
-            )
-
-        self.batchnorm = torch.nn.BatchNorm2d(num_out_filters)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.batchnorm(x)
-        if self.activation == 'relu':
-            return torch.nn.functional.relu(x)
-        return x
-
-
-# ==========================================
-# 👑 创新模块：注意力引导的轻量化残差路径 (Attention-Guided Lightweight ResPath)
-# 解决后期网络过于保守而过滤浅色病灶的痛点
-# ==========================================
-class ResPath(torch.nn.Module):
-    def __init__(self, num_in_filters, num_out_filters, respath_length):
-        super().__init__()
-        self.respath_length = respath_length
-        self.shortcuts = torch.nn.ModuleList([])
-        self.convs = torch.nn.ModuleList([])
-        self.bns = torch.nn.ModuleList([])
-
-        for i in range(self.respath_length):
-            in_channels = num_in_filters if i == 0 else num_out_filters
-            self.shortcuts.append(
-                LightConv2d_batchnorm(in_channels, num_out_filters, kernel_size=(1, 1), activation='None'))
-            self.convs.append(
-                LightConv2d_batchnorm(in_channels, num_out_filters, kernel_size=(3, 3), activation='relu'))
-            self.bns.append(torch.nn.BatchNorm2d(num_out_filters))
-
-        # 🌟【新增】：轻量级空间注意力 (Spatial Attention)
-        # 仅增加几十个参数，极度廉价却能赋予网络空间筛选能力
-        self.spatial_attention = torch.nn.Sequential(
-            torch.nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
-            torch.nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        x = x.permute(0, 3, 1, 2).contiguous()
-
-        for i in range(self.respath_length):
-            shortcut = self.shortcuts[i](x)
-
-            x_main = self.convs[i](x)
-            x_main = self.bns[i](x_main)
-            x_main = torch.nn.functional.relu(x_main)
-
-            x = x_main + shortcut
-            x = self.bns[i](x)
-            x = torch.nn.functional.relu(x)
-
-        # 🌟【新增】：在送出浅层特征之前，进行空间注意力筛选
-        # 分别提取通道的平均池化和最大池化特征
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        # 拼接后计算注意力权重 (0~1 之间)
-        attention_map = self.spatial_attention(torch.cat([avg_out, max_out], dim=1))
-
-        # 将不重要的毛发区域压制，突出真正的浅色病灶区域！
-        x = x * (1.0 + attention_map)
-
-        x = x.permute(0, 2, 3, 1).contiguous()
-        return x
-
-
-# ==========================================
-
-
 class FCD_Module(nn.Module):
     r"""
-    FCD-Module v2: Parallel Clean/Enhance with Learnable Routing
-    - clean_phase: morphological hair removal (unchanged)
-    - enhance_phase: LAB-space gamma with LEARNABLE gamma parameter
-    - routing: per-pixel soft blend between cleaned and enhanced streams
+    FCD-Module: Feature Clean-then-Enhance Decoupling Module
+    Replaces traditional PatchEmbed2D to provide physics-based cleaning and color space enhancement.
     """
 
     def __init__(self, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None, **kwargs):
@@ -227,29 +88,14 @@ class FCD_Module(nn.Module):
         self.C = embed_dim
         self.patch_size = patch_size
 
-        # 1. Morphological operator kernel
+        # 1. 形态学算子：使用 MaxPool 模拟膨胀
         self.morph_kernel = 5
         self.padding = self.morph_kernel // 2
 
-        # 2. 【Fix 1】LEARNABLE gamma — initialized to 0.7 (< 1 brightens)
-        #    nn.Parameter, NOT register_buffer
-        self.gamma = nn.Parameter(torch.tensor([0.7]).view(1, 1, 1, 1))
+        # 2. 自适应对比度拉伸系数 (删除了破坏物理意义的 1x1 Conv，Gamma 仅作用于 1 个 L 通道)
+        self.gamma = nn.Parameter(torch.ones(1, 1, 1, 1))
 
-        # 3. 【Fix 5】Per-pixel routing network
-        #    Input: 6 channels (3 from cleaned + 3 from enhanced)
-        #    Output: 1 channel sigmoid mask (0 = use cleaned, 1 = use enhanced)
-        self.blend_net = nn.Sequential(
-            nn.Conv2d(6, 16, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        # Initialize blend_net final layer bias to 0 → sigmoid(0)=0.5
-        # so both streams contribute equally at the start
-        nn.init.constant_(self.blend_net[3].bias, 0.0)
-
-        # 4. Patch Embedding Projection (unchanged)
+        # 3. 原生的 Patch Embedding Projection
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
         self.proj = nn.Conv2d(3, self.C, kernel_size=patch_size, stride=patch_size)
@@ -260,73 +106,71 @@ class FCD_Module(nn.Module):
             self.norm = None
 
     def clean_phase(self, x):
-        """Phase A: Morphological hair removal (fully preserved from your version)"""
+        """阶段 A: 物理清洗层 (先物理超度毛发)"""
         B, C, H, W = x.shape
 
+        # 【全局图像 Min-Max 归一化】保护色调一致性
         x_min = x.view(B, -1).min(dim=-1)[0].view(B, 1, 1, 1)
         x_max = x.view(B, -1).max(dim=-1)[0].view(B, 1, 1, 1)
         x_norm = (x - x_min) / (x_max - x_min + 1e-6)
 
+        # ---------------- 找毛发位置 (在单通道灰度图上进行，最准) ----------------
         x_gray = x_norm.mean(dim=1, keepdim=True)
-        dilation_gray = F.max_pool2d(x_gray, kernel_size=self.morph_kernel,
-                                     stride=1, padding=self.padding)
-        erosion_gray = -F.max_pool2d(-dilation_gray, kernel_size=self.morph_kernel,
-                                     stride=1, padding=self.padding)
-
+        dilation_gray = F.max_pool2d(x_gray, kernel_size=self.morph_kernel, stride=1, padding=self.padding)
+        erosion_gray = -F.max_pool2d(-dilation_gray, kernel_size=self.morph_kernel, stride=1, padding=self.padding)
         hair_mask = torch.clamp(torch.abs(x_gray - erosion_gray) * 10.0, 0.0, 1.0)
-        hair_mask = F.max_pool2d(hair_mask, kernel_size=3, stride=1, padding=1)
 
-        dilation_rgb = F.max_pool2d(x_norm, kernel_size=self.morph_kernel,
-                                    stride=1, padding=self.padding)
-        erosion_rgb = -F.max_pool2d(-dilation_rgb, kernel_size=self.morph_kernel,
-                                    stride=1, padding=self.padding)
-        smooth_erosion_rgb = F.avg_pool2d(erosion_rgb, kernel_size=3, stride=1, padding=1)
+        # ---------------- 准备回填皮肤 (在三通道RGB图上进行，保色) ----------------
+        # 【最终修复】：对彩色图直接进行闭运算，得到色彩连续的平滑无毛皮肤底色
+        dilation_rgb = F.max_pool2d(x_norm, kernel_size=self.morph_kernel, stride=1, padding=self.padding)
+        erosion_rgb = -F.max_pool2d(-dilation_rgb, kernel_size=self.morph_kernel, stride=1, padding=self.padding)
 
-        x_cleaned_final = x_norm * (1 - hair_mask) + smooth_erosion_rgb * hair_mask
-        return x_cleaned_final.clamp(1e-5, 1.0)
+        # 物理彩色回填！
+        x_cleaned = x_norm * (1 - hair_mask) + erosion_rgb * hair_mask
 
-    def enhance_phase(self, x_input):
-        """Phase B: LAB gamma correction — now from ORIGINAL input, not cleaned"""
-        x_lab = kornia.color.rgb_to_lab(x_input)
+        # 硬件级浮点安全锁
+        return x_cleaned.clamp(1e-5, 1.0)
 
+    def enhance_phase(self, x_cleaned):
+        """阶段 B: 安全增强层 (在纯净 LAB 空间进行解耦亮度增强)"""
+        # 1. 转换到 LAB 空间 (Kornia输出：L在约[0,100], a和b在约[-128,127])
+        x_lab = kornia.color.rgb_to_lab(x_cleaned)
+
+        # 2. 通道解耦：分离明暗(L)与色彩(A,B)
         L = x_lab[:, 0:1, :, :]
         A = x_lab[:, 1:2, :, :]
-        B_ch = x_lab[:, 2:3, :, :]  # renamed to avoid shadowing
+        B = x_lab[:, 2:3, :, :]
 
-        L_norm = torch.clamp(L / 100.0, 1e-6, 1.0)
+        # 3. 提取并归一化 L 通道 (限制在安全的浮点范围内供求幂计算)
+        L_norm = L / 100.0
+        L_norm = torch.clamp(L_norm, 1e-6, 1.0)
 
-        # 【Fix 1】gamma is now a learnable Parameter
-        gamma_safe = torch.clamp(self.gamma.abs(), min=0.3, max=2.0)
+        # 4. 限制 Gamma 范围，防止求导时梯度爆炸
+        gamma_safe = torch.clamp(torch.abs(self.gamma), min=0.5, max=3.0)
+
+        # 5. 仅对亮度 L 进行非线性 Gamma 校正 (彻底保留原本病灶特征色彩)
         L_enhanced_norm = torch.pow(L_norm, gamma_safe)
 
+        # 6. 还原 L 通道尺度
         L_enhanced = L_enhanced_norm * 100.0
-        lab_enhanced = torch.cat([L_enhanced, A, B_ch], dim=1)
+
+        # 7. 重新拼接 LAB
+        lab_enhanced = torch.cat([L_enhanced, A, B], dim=1)
+
+        # 8. 转回 RGB 空间供后续 Patch Embedding 使用
         x_enhanced_rgb = kornia.color.lab_to_rgb(lab_enhanced)
+
         return x_enhanced_rgb.clamp(1e-5, 1.0)
 
     def forward(self, x):
-        # 【Fix 5 — Critical Change】: Parallel, not sequential
-        # Normalize input to [0,1] for both branches
-        B, C, H, W = x.shape
-        x_min = x.view(B, -1).min(dim=-1)[0].view(B, 1, 1, 1)
-        x_max = x.view(B, -1).max(dim=-1)[0].view(B, 1, 1, 1)
-        x_01 = (x - x_min) / (x_max - x_min + 1e-6)
+        x_cleaned = self.clean_phase(x)
+        x_enhanced = self.enhance_phase(x_cleaned)
 
-        x_cleaned = self.clean_phase(x)        # hair removal stream
-        x_enhanced = self.enhance_phase(x_01)   # contrast boost stream (from original)
-
-        # Per-pixel routing: network sees both candidates and decides blend
-        blend_input = torch.cat([x_cleaned, x_enhanced], dim=1)  # (B, 6, H, W)
-        alpha = self.blend_net(blend_input)  # (B, 1, H, W), range [0, 1]
-
-        # alpha≈0 → use cleaned (good for hairy regions)
-        # alpha≈1 → use enhanced (good for light lesions)
-        x_fused = (1 - alpha) * x_cleaned + alpha * x_enhanced
-
-        # Standard patch embedding
-        x_patched = self.proj(x_fused).permute(0, 2, 3, 1).contiguous()
+        # 完美对接 VM-UNet 后续
+        x_patched = self.proj(x_enhanced).permute(0, 2, 3, 1).contiguous()
         if self.norm is not None:
             x_patched = self.norm(x_patched)
+
         return x_patched
 
 
@@ -509,21 +353,7 @@ class SS2D(nn.Module):
 
         # 【核心创新】：0初始化门控，防止新增路径破坏预训练平衡
         self.spiral_alpha = nn.Parameter(torch.zeros(1))
-
-        # Compute resolution estimate FIRST
-        if self.d_model <= 96:
-            res_estimate = 64
-        elif self.d_model <= 192:
-            res_estimate = 32
-        elif self.d_model <= 384:
-            res_estimate = 16
-        else:
-            res_estimate = 8
-
-        # Then conditionally create SASF
-        self.use_sasf = (192 <= self.d_inner <= 768)
-        if self.use_sasf:
-            self.sasf_spiral = Adaptive_SASF_v2(dim=self.d_inner, resolution=res_estimate)
+        # =========================================================================
 
         self.forward_core = self.forward_core_decoupled
 
@@ -690,23 +520,10 @@ class SS2D(nn.Module):
         wh_y = torch.transpose(out_y_4[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
         invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
 
-        # 1. 螺旋路径原本的一维还原 shape: (B, d_inner, L)
         y_spiral_restored = out_y_1[:, 0][:, :, inv_idx_spiral]
 
-        # -----------------------------------------------------------
-        # 👑 终极融合：将 1D 螺旋序列的空间错位，通过 Adaptive-SASF 进行二维接骨修复
-        # -----------------------------------------------------------
-        # 2. 将还原后的一维特征重新折叠为真实的 2D 图像格式 shape: (B, d_inner, H, W)
-        y_spiral_2d = y_spiral_restored.view(B, -1, H, W)
-        if self.use_sasf:
-            y_spiral_sasf_2d = self.sasf_spiral(y_spiral_2d)
-        else:
-            y_spiral_sasf_2d = y_spiral_2d
-        y_spiral_final = y_spiral_sasf_2d.view(B, -1, L)
-        # -----------------------------------------------------------
-
-        # 返回 5 个独立的张量 (第 5 个现已具备自适应多尺度 2D 结构感知能力)
-        return out_y_4[:, 0], inv_y[:, 0], wh_y, invwh_y, y_spiral_final
+        # 返回 5 个独立的张量
+        return out_y_4[:, 0], inv_y[:, 0], wh_y, invwh_y, y_spiral_restored
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
@@ -919,17 +736,6 @@ class VSSM(nn.Module):
                 use_checkpoint=use_checkpoint,
             )
             self.layers_up.append(layer)
-        self.respaths = nn.ModuleList()
-        # VM-UNet 的 forward_features_up 实际上只用到 3 个跳跃连接
-        # 从深到浅分别是 8C, 4C, 2C 对应的特征层
-        skip_dims = [dims[3], dims[2], dims[1]]
-        # 动态深度控制：深层语义鸿沟小(用3个块)，浅层语义鸿沟大(用1个块)
-        respath_lengths = [3, 2, 1]
-
-        for i in range(3):
-            self.respaths.append(ResPath(num_in_filters=skip_dims[i],
-                                         num_out_filters=skip_dims[i],
-                                         respath_length=respath_lengths[i]))
 
         self.final_up = Final_PatchExpand2D(dim=dims_decoder[-1], dim_scale=4, norm_layer=norm_layer)
         self.final_conv = nn.Conv2d(dims_decoder[-1] // 4, num_classes, 1)
@@ -970,12 +776,7 @@ class VSSM(nn.Module):
             if inx == 0:
                 x = layer_up(x)
             else:
-                # 【新增】通过 ResPath 对浅层特征进行语义跃迁
-                # respaths[0, 1, 2] 对应于 inx=1, 2, 3
-                processed_skip = self.respaths[inx - 1](skip_list[-inx])
-
-                # 语义对齐后的完美融合
-                x = layer_up(x + processed_skip)
+                x = layer_up(x + skip_list[-inx])
 
         return x
 
