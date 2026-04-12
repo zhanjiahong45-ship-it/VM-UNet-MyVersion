@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 from tqdm import tqdm
 import torch
 from torch.cuda.amp import autocast as autocast
@@ -15,6 +16,22 @@ def _inpaint_with_skin(img_tensor, prob, threshold=0.4):
     return img_tensor * (1 - anchor) + skin_color.expand_as(img_tensor) * anchor
 
 
+def _apply_clahe(img_tensor, clip_limit=2.0, tile_grid=(8, 8)):
+    """对 [B, C, H, W] tensor 在 LAB 空间的 L 通道做 CLAHE，增强补色后图像的对比度。
+    保持原始数值范围不变，仅改变通道内对比度分布。"""
+    arr = img_tensor.squeeze(0).permute(1, 2, 0).cpu().float().numpy()  # [H, W, C]
+    v_min, v_max = arr.min(), arr.max()
+    # 映射到 uint8 供 OpenCV 处理
+    arr_u8 = ((arr - v_min) / (v_max - v_min + 1e-8) * 255).clip(0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(arr_u8, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    enhanced_u8 = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    # 映射回原始数值范围
+    enhanced = enhanced_u8.astype(np.float32) / 255.0 * (v_max - v_min) + v_min
+    return torch.from_numpy(enhanced).permute(2, 0, 1).unsqueeze(0).contiguous().to(img_tensor.device)
+
+
 def train_one_epoch(train_loader,
                     model,
                     criterion,
@@ -25,9 +42,12 @@ def train_one_epoch(train_loader,
                     logger,
                     config,
                     writer,
-                    scaler=None): # 👑 补上 scaler 参数
+                    scaler=None,
+                    early_model=None):
     model.train()
     loss_list = []
+    # 浅色 pseudo-label loss 的权重，可在 config 里覆盖，默认 0.5
+    faint_loss_weight = getattr(config, 'faint_loss_weight', 0.5)
 
     for iter, data in enumerate(train_loader):
         step += iter
@@ -35,15 +55,31 @@ def train_one_epoch(train_loader,
         images, targets = data
         images, targets = images.cuda(non_blocking=True).float(), targets.cuda(non_blocking=True).float()
 
-        # 👑 加上混合精度上下文
         with autocast(enabled=config.amp):
             out = model(images)
 
-        # 2. 将输出强制转回高精度 FP32，并在 autocast 外部计算 Loss
-        # 这样 BCELoss 接收到的是绝对安全的 Float32 数据，就不会报错了
         loss = criterion(out.float(), targets.float())
 
-        # 3. 反向传播保持不变
+        # ── 浅色病灶两遍蒸馏 (epoch>=5, early_model 已就绪时生效) ──────────────
+        if early_model is not None and faint_loss_weight > 0:
+            # Step-1: 用【主模型】输出检测浅色样本（高峰值 + 稀疏分布）
+            out_det = out.detach()
+            faint_idx = [
+                i for i in range(images.shape[0])
+                if out_det[i].max().item() > 0.5 and out_det[i].mean().item() < 0.05
+            ]
+
+            if faint_idx:
+                fi = torch.tensor(faint_idx, device=images.device)
+                # 浅色样本用 GT 再压一次，不绕 mask_e2 pseudo-label
+                faint_loss = criterion(out[fi].float(), targets[fi].float())
+                loss = loss + faint_loss_weight * faint_loss
+
+                if iter % config.print_interval == 0:
+                    writer.add_scalar('faint/count', len(faint_idx), global_step=step)
+                    writer.add_scalar('faint/loss', faint_loss.item(), global_step=step)
+        # ─────────────────────────────────────────────────────────────────────
+
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -54,15 +90,12 @@ def train_one_epoch(train_loader,
 
         loss_list.append(loss.item())
 
-        now_lr = optimizer.state_dict()['param_groups'][0]['lr']
-
         writer.add_scalar('loss', loss, global_step=step)
 
         if iter % config.print_interval == 0:
             try:
                 gamma_val = model.vmunet.patch_embed.gamma.item()
                 writer.add_scalar('fcd/gamma', gamma_val, global_step=step)
-                # Also log spiral_alpha from the first SS2D block
                 alpha_val = model.vmunet.layers[0].blocks[0].self_attention.spiral_alpha.item()
                 writer.add_scalar('spiral/alpha_layer0', alpha_val, global_step=step)
             except:
@@ -71,29 +104,40 @@ def train_one_epoch(train_loader,
     return step
 
 
-def val_one_epoch(val_loader,  # 👑 名字改为 val_loader
+def val_one_epoch(val_loader,
                   model,
                   criterion,
                   epoch,
                   logger,
                   config,
-                  writer=None):  # 👑 补上 writer 参数
+                  writer=None,
+                  early_model=None):
     model.eval()
     preds = []
     gts = []
     loss_list = []
 
-    # 【Bug修复 1】：提供安全的默认返回值，防止非 val_interval 轮次抛出 UnboundLocalError
     miou = 0.0
 
     with torch.no_grad():
-        for data in tqdm(val_loader):  # 👑 这里也要同步改成 val_loader
+        for data in tqdm(val_loader):
             img, msk = data
             img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
 
-            # 【已精简】：删除 4 视角 TTA，恢复最纯粹的前向传播
             out = model(img)
             out = out[0] if type(out) is tuple else out
+
+            # ── val 两遍精炼（与 test 逻辑对齐，使 mIoU 更真实）─────────────
+            if early_model is not None:
+                if out.max().item() > 0.5 and out.mean().item() < 0.05:
+                    mask_e1 = early_model(img)
+                    mask_e1 = mask_e1[0] if isinstance(mask_e1, tuple) else mask_e1
+                    img2 = _inpaint_with_skin(img, mask_e1, threshold=0.4)
+                    img2 = _apply_clahe(img2)
+                    mask_e2 = early_model(img2)
+                    mask_e2 = mask_e2[0] if isinstance(mask_e2, tuple) else mask_e2
+                    out = mask_e2
+            # ────────────────────────────────────────────────────────────────
 
             loss = criterion(out, msk)
             loss_list.append(loss.item())
@@ -141,8 +185,8 @@ def test_one_epoch(test_loader,
                    criterion,
                    logger,
                    config,
-                   test_data_name=None):
-    # switch to evaluate mode
+                   test_data_name=None,
+                   early_model=None):
     model.eval()
     preds = []
     gts = []
@@ -156,12 +200,21 @@ def test_one_epoch(test_loader,
             out = model(img)
             out = out[0] if isinstance(out, tuple) else out
 
-            # 两遍精炼：稀疏高置信 = 浅色病灶，触发补色后第二遍
+            # 两遍精炼：主模型检测浅色 → early_model 两刀 → 直接用 mask_e2
             if out.max() > 0.5 and out.mean() < 0.05:
-                img2 = _inpaint_with_skin(img, out)
-                out2 = model(img2)
-                out2 = out2[0] if isinstance(out2, tuple) else out2
-                out = torch.max(out, out2)
+                if early_model is not None:
+                    mask_e1 = early_model(img)
+                    mask_e1 = mask_e1[0] if isinstance(mask_e1, tuple) else mask_e1
+                    img2 = _inpaint_with_skin(img, mask_e1, threshold=0.4)
+                    img2 = _apply_clahe(img2)
+                    mask_e2 = early_model(img2)
+                    mask_e2 = mask_e2[0] if isinstance(mask_e2, tuple) else mask_e2
+                    out = mask_e2
+                else:
+                    img2 = _inpaint_with_skin(img, out)
+                    out2 = model(img2)
+                    out2 = out2[0] if isinstance(out2, tuple) else out2
+                    out = torch.max(out, out2)
 
             loss = criterion(out, msk)
             loss_list.append(loss.item())

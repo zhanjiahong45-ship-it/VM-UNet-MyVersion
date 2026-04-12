@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import warnings
 from PIL import Image
+import matplotlib.pyplot as plt
 from models.vmunet.vmunetff import VMUNet
 from datasets.dataset import NPY_datasets
 from engine import train_one_epoch, val_one_epoch
@@ -243,28 +244,40 @@ def main(config):
             logger.info("Phase 2: 切换到 1N 数据集")
 
             # 选出最佳早期模型
-            early_ckpts = [os.path.join(checkpoint_dir, f'epoch_{i:03d}.pth') for i in [2, 3, 4]]
-            best_early_path = select_best_early_model(early_ckpts, config, device)
-            early_model = build_model(config, device)
-            early_model.load_state_dict(torch.load(best_early_path, map_location=device))
-            early_model.eval()
-            logger.info(f"早期模型已选定: {best_early_path}")
+            import traceback
+            try:
+                early_ckpts = [os.path.join(checkpoint_dir, f'epoch_{i:03d}.pth') for i in [2, 3, 4]]
+                best_early_path = select_best_early_model(early_ckpts, config, device)
+                early_model = build_model(config, device)
+                early_model.load_state_dict(torch.load(best_early_path, map_location=device))
+                early_model.eval()
+                logger.info(f"早期模型已选定: {best_early_path}")
+            except Exception as e:
+                logger.error(f"早期模型选择失败: {e}\n{traceback.format_exc()}")
+                early_model = None
 
         train_loss = train_one_epoch(
             train_loader=train_loader, model=model, criterion=criterion,
             optimizer=optimizer, scheduler=scheduler, epoch=epoch,
-            step=step, logger=logger, config=config, writer=writer, scaler=scaler
+            step=step, logger=logger, config=config, writer=writer, scaler=scaler,
+            early_model=early_model,
         )
 
         val_loss, current_miou = val_one_epoch(
             val_loader=val_loader, model=model, criterion=criterion,
-            epoch=epoch, logger=logger, config=config, writer=writer
+            epoch=epoch, logger=logger, config=config, writer=writer,
+            early_model=early_model,
         )
 
         if current_miou > max_miou:
             max_miou = current_miou
             best_epoch = epoch
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, 'best.pth'))
+            if early_model is not None:
+                torch.save(
+                    {'model': model.state_dict(), 'early_model': early_model.state_dict()},
+                    os.path.join(checkpoint_dir, 'mixture.pth')
+                )
             logger.info(f'New best mIoU: {max_miou:.4f} at epoch {epoch}')
 
         # 保存 epoch 2/3/4 权重供早期模型选择
@@ -272,12 +285,10 @@ def main(config):
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch_{epoch:03d}.pth'))
             logger.info(f'Saved early checkpoint: epoch_{epoch:03d}.pth')
 
-        # epoch5 之后才追踪困难样本
-        if epoch >= 5:
-            try:
-                track_hard_samples(model, epoch, config, device, early_model=early_model)
-            except Exception as e:
-                logger.warning(f"困难样本追踪失败: {e}")
+        try:
+            track_hard_samples(model, epoch, config, device, early_model=early_model)
+        except Exception as e:
+            logger.warning(f"困难样本追踪失败: {e}")
 
     logger.info(f'Training Complete! Best mIoU: {max_miou:.4f} at epoch {best_epoch}')
 

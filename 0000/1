@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "trainff.py", line 298, in <module>
+    main(config)
+  File "trainff.py", line 266, in main
+    val_loss, current_miou = val_one_epoch(
+  File "/root/root/VM-UNet/engine.py", line 137, in val_one_epoch
+    mask_e2 = early_model(img2)
+  File "/root/miniconda3/envs/vmunet/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/root/root/VM-UNet/models/vmunet/vmunetff.py", line 30, in forward
+    logits = self.vmunet(x)
+  File "/root/miniconda3/envs/vmunet/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/root/root/VM-UNet/models/vmunet/vmambaff.py", line 800, in forward
+    x, skip_list = self.forward_features(x)
+  File "/root/root/VM-UNet/models/vmunet/vmambaff.py", line 764, in forward_features
+    x = self.patch_embed(x)
+  File "/root/miniconda3/envs/vmunet/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1190, in _call_impl
+    return forward_call(*input, **kwargs)
+  File "/root/root/VM-UNet/models/vmunet/vmambaff.py", line 166, in forward
+    x_cleaned = self.clean_phase(x)
+  File "/root/root/VM-UNet/models/vmunet/vmambaff.py", line 113, in clean_phase
+    x_min = x.view(B, -1).min(dim=-1)[0].view(B, 1, 1, 1)
+RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+(vmunet) root@autodl-container-74204da04f-25236e01:~/root/VM-UNet# cd /root/root/VM-UNet

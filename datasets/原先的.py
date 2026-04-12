@@ -76,8 +76,8 @@ class NPY_datasets(Dataset):
             elif self.phase == 2:
                 # 👑 Phase 2 修复：在 1N 数据集中，依然保留 25% 的概率随机生成一种极其微弱的变体
                 # 这样 Decoder 就绝对不敢屏蔽 Encoder 传来的浅色特征了
-                if random.random() < 0.25:
-                    random_mode = random.choice(['ghost', 'shattered'])
+                if random.random() < 0.50:
+                    random_mode = random.choice(['diffuse', 'donut', 'shattered', 'ghost'])
                     image, label = self.faint_augmentor.apply_specific_mode((image, label), mode=random_mode)
 
             image, label = self.transformer((image, label))
