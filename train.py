@@ -146,6 +146,24 @@ def main(config):
             min_loss = loss
             min_epoch = epoch
 
+        # ---------------------------------------------------------
+        # --- 新增：保存每一个 epoch 的 checkpoint (方便后续随时调用或分析) ---
+        # ---------------------------------------------------------
+        epoch_save_path = os.path.join(checkpoint_dir, f'epoch_{epoch:03d}.pth')
+        torch.save(
+            {
+                'epoch': epoch,
+                'min_loss': min_loss,
+                'min_epoch': min_epoch,
+                'loss': loss,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+            }, epoch_save_path)
+
+        logger.info(f'Saved checkpoint for epoch {epoch} to: {epoch_save_path}')
+        # ---------------------------------------------------------
+
         torch.save(
             {
                 'epoch': epoch,

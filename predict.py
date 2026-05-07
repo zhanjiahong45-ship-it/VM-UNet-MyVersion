@@ -12,10 +12,12 @@ from models.vmunet.vmunetff import VMUNet
 # ==========================================
 # 👑 强烈建议：将这里的路径替换为你最新训练出来的带有 miou 后缀的最佳权重
 # 例如: 'checkpoints/best-epoch76-miou0.8288.pth'
-MODEL_PATH = '/root/root/VM-UNet/results/vmunet_isic18_Monday_06_April_2026_00h_30m_14s/checkpoints/best.pth'
+MODEL_PATH = '/root/root/VM-UNet/results/FC_8255/checkpoints/early_epochs/epoch_004_miou0.7906.pth'
 IMG_SIZE = 256
 INPUT_DIR = 'inputs'
-OUTPUT_MASK_DIR = 'outputs_mask'       # 保存用于指标计算的纯净二值 Mask
+
+
+OUTPUT_MASK_DIR = ('Early')  # 保存用于指标计算的纯净二值 Mask
 OUTPUT_OVERLAY_DIR = 'outputs_overlay' # 保存用于论文展示的直观叠加图
 
 # 👑 强烈建议：将这里的 0.5 换成你测试阶段网格搜索出的最佳阈值

@@ -352,7 +352,7 @@ class SS2D(nn.Module):
         self.Ds_spiral = self.D_init(self.d_inner, copies=1, merge=True)
 
         # 【核心创新】：0初始化门控，防止新增路径破坏预训练平衡
-        self.spiral_alpha = nn.Parameter(torch.zeros(1))
+        self.spiral_alpha = nn.Parameter(torch.full((1,), 0.1))
         # =========================================================================
 
         self.forward_core = self.forward_core_decoupled

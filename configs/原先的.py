@@ -21,6 +21,11 @@ class setting_config:
 
     datasets = 'isic18'
     if datasets == 'isic18':
+
+        train_path = '/root/root/VM-UNet/data/isic18/train'
+
+        val_path = '/root/root/VM-UNet/data/val'  # 注意确认一下有没有多打一个 root
+
         data_path = './data/isic18/'
     elif datasets == 'isic17':
         data_path = './data/isic17/'

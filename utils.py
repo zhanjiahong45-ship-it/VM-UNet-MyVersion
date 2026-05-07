@@ -1073,6 +1073,9 @@ class myFaintLesionAugmentor:
             'multi': self._gen_multi,
             'shattered': self._gen_shattered,
             'ghost': self._gen_ghost,
+            'partial_half': self._gen_partial_half,  # ← 新增
+            'partial_blob': self._gen_partial_blob,  # ← 新增
+            'partial_multiblob': self._gen_partial_multiblob,  # ← 新增
         }
 
         # 如果传入了不存在的模式，默认使用 diffuse
@@ -1083,7 +1086,8 @@ class myFaintLesionAugmentor:
         if random.random() < 0.7:
             fade_mask = self._patchy(fade_mask, h, w)
 
-        if mode == 'ghost' or self._ghost_override:
+        high_strength_modes = {'ghost', 'partial_half', 'partial_blob', 'partial_multiblob'}
+        if mode in high_strength_modes or self._ghost_override:
             strength = random.uniform(0.85, 0.98)
         else:
             strength = random.uniform(*self.fade_range)
@@ -1099,6 +1103,48 @@ class myFaintLesionAugmentor:
         # mask 保持不变，强制模型学习隐秘特征
         return result, mask
 
+    def _apply_pale(self, image, mask):
+        """
+        Pale 变体：整图低饱和度 + 提亮，模拟白皙肤色拍摄场景。
+        与 6 种 fade variants 不同，pale 不区分病灶/背景，整张图统一处理。
+        GT mask 保留不变。
+
+        随机参数：
+            saturation_factor ∈ [0.3, 0.6]
+            lightness_boost   ∈ [0.10, 0.25]
+        """
+        was_uint8 = image.dtype == np.uint8
+        img = image.astype(np.float32)
+        if not was_uint8 and img.max() <= 1.5:
+            img = img * 255.0
+            input_was_01 = True
+        else:
+            input_was_01 = False
+
+        # Step 1: 降饱和度
+        gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
+        gray_3ch = np.stack([gray, gray, gray], axis=-1)
+        sat_factor = random.uniform(0.3, 0.6)
+        img_desat = gray_3ch + sat_factor * (img - gray_3ch)
+
+        # Step 2: 整体提亮
+        boost = random.uniform(0.10, 0.25)
+        img_pale = img_desat + boost * (255.0 - img_desat)
+
+        # Step 3: 微小高斯噪声
+        noise = np.random.normal(0, 2.0, img_pale.shape).astype(np.float32)
+        img_pale = img_pale + noise
+
+        # Step 4: clip
+        img_pale = np.clip(img_pale, 0, 255)
+
+        # Step 5: 还原 dtype/range
+        if input_was_01:
+            img_pale = img_pale / 255.0
+        if was_uint8:
+            img_pale = img_pale.astype(np.uint8)
+
+        return img_pale, mask
     # ==================================================================
     # Shape primitives — fully randomized
     # ==================================================================
@@ -1290,6 +1336,94 @@ class myFaintLesionAugmentor:
         self._ghost_override = True
         return fade
 
+    def _gen_partial_half(self, h, w, m, bb):
+        """病灶的一半被高强度褪色，方向 8 选 1（上/下/左/右/4 个对角）。"""
+        y0, x0, y1, x1 = bb
+        cy = (y0 + y1) / 2.0
+        cx = (x0 + x1) / 2.0
+        bh = max(y1 - y0, 1)
+        bw = max(x1 - x0, 1)
+
+        direction = random.choice(['top', 'bottom', 'left', 'right',
+                                   'tl', 'tr', 'bl', 'br'])
+        ys_grid, xs_grid = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+
+        if direction == 'top':
+            cond = ys_grid < cy
+        elif direction == 'bottom':
+            cond = ys_grid >= cy
+        elif direction == 'left':
+            cond = xs_grid < cx
+        elif direction == 'right':
+            cond = xs_grid >= cx
+        elif direction == 'tl':
+            cond = (ys_grid < cy) & (xs_grid < cx)
+        elif direction == 'tr':
+            cond = (ys_grid < cy) & (xs_grid >= cx)
+        elif direction == 'bl':
+            cond = (ys_grid >= cy) & (xs_grid < cx)
+        else:  # 'br'
+            cond = (ys_grid >= cy) & (xs_grid >= cx)
+
+        fade_mask = m * cond.astype(np.float32)
+
+        # 高斯羽化，避免直角硬边引入伪影
+        ksize = max(int(min(bh, bw) * 0.1), 3)
+        if ksize % 2 == 0:
+            ksize += 1
+        try:
+            import cv2
+            fade_mask = cv2.GaussianBlur(fade_mask, (ksize, ksize), 0)
+        except ImportError:
+            from scipy.ndimage import gaussian_filter
+            fade_mask = gaussian_filter(fade_mask, sigma=ksize / 3.0)
+        fade_mask = fade_mask * m  # 限制在病灶内
+
+        return fade_mask.astype(np.float32)
+
+    def _gen_partial_blob(self, h, w, m, bb):
+        """病灶内单个连续椭圆 blob 被高强度褪色，占病灶面积 30-60%。"""
+        y0, x0, y1, x1 = bb
+        bh = max(y1 - y0, 1)
+        bw = max(x1 - x0, 1)
+
+        target_ratio = random.uniform(0.30, 0.60)
+        # 椭圆面积 = π·ra·rb ≈ target_ratio · bh · bw
+        radius = np.sqrt(target_ratio * bh * bw / np.pi)
+        ra = radius * random.uniform(0.7, 1.3)
+        rb = radius * random.uniform(0.7, 1.3)
+
+        # blob 中心偏向病灶中心 60% 区域，避免完全在边缘
+        bcy = random.uniform(y0 + bh * 0.2, y1 - bh * 0.2)
+        bcx = random.uniform(x0 + bw * 0.2, x1 - bw * 0.2)
+
+        single_blob = self._rand_shape(h, w, bcy, bcx, ra, rb)
+        fade_mask = single_blob * m  # 限制在病灶内
+
+        return fade_mask.astype(np.float32)
+
+    def _gen_partial_multiblob(self, h, w, m, bb):
+        """病灶内多个分散小斑块被高强度褪色，2-4 个 blob，总面积 30-60%。"""
+        y0, x0, y1, x1 = bb
+        bh = max(y1 - y0, 1)
+        bw = max(x1 - x0, 1)
+
+        n_blobs = random.randint(2, 4)
+        target_ratio = random.uniform(0.30, 0.60)
+        per_blob_area = target_ratio * bh * bw / n_blobs
+
+        fade_mask = np.zeros((h, w), dtype=np.float32)
+        for _ in range(n_blobs):
+            radius = np.sqrt(per_blob_area / np.pi)
+            ra = radius * random.uniform(0.6, 1.2)
+            rb = radius * random.uniform(0.6, 1.2)
+            bcy = random.uniform(y0, y1)
+            bcx = random.uniform(x0, x1)
+            single = self._rand_shape(h, w, bcy, bcx, ra, rb)
+            fade_mask = np.maximum(fade_mask, single)
+        fade_mask = fade_mask * m  # 限制在病灶内
+
+        return fade_mask.astype(np.float32)
     # ==================================================================
     # Legacy __call__ (保留以兼容旧的普通 transform 模式)
     # ==================================================================
@@ -1315,3 +1449,142 @@ class myFaintLesionAugmentor:
 
         # 委托给新的 apply_specific_mode 处理
         return self.apply_specific_mode(data, mode)
+
+
+class TverskyLoss(nn.Module):
+    """
+    Tversky Loss = 1 - TI
+        TI = TP / (TP + α·FP + β·FN + smooth)
+
+    α 小、β 大 → 重罚漏检（FN），适合救小目标和浅色漏检
+    α=0.5, β=0.5 等价于 Dice
+    α=0.3, β=0.7 是论文常用的"重罚漏检"配置
+    """
+
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        # pred 是 sigmoid 后的概率（VMUNet.forward 已经 sigmoid）
+        pred = pred.contiguous().view(-1)
+        target = target.contiguous().view(-1)
+        TP = (pred * target).sum()
+        FP = (pred * (1 - target)).sum()
+        FN = ((1 - pred) * target).sum()
+        TI = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
+        return 1.0 - TI
+
+
+class BceTverskyLoss(nn.Module):
+    """
+    BCE + Tversky 组合，接口和 BceDiceLoss 一致
+        wb: BCE 权重
+        wt: Tversky 权重
+        alpha, beta: Tversky 的 FP/FN 权重
+    """
+
+    def __init__(self, wb=1.0, wt=1.0, alpha=0.3, beta=0.7):
+        super().__init__()
+        self.bce = nn.BCELoss()
+        self.tversky = TverskyLoss(alpha=alpha, beta=beta)
+        self.wb = wb
+        self.wt = wt
+
+    def forward(self, pred, target):
+        return self.wb * self.bce(pred, target) + self.wt * self.tversky(pred, target)
+
+
+# utils.py
+import torch
+import torch.nn as nn
+
+
+class BCEJaccardLoss(nn.Module):
+    def __init__(self, smooth=1e-5):
+        super(BCEJaccardLoss, self).__init__()
+        # eps (smooth) 即原文中的平滑指数 e
+        self.smooth = smooth
+        self.bce = nn.BCELoss()
+
+    def forward(self, pred, target):
+        # 1. 计算 BCE Loss (对应原文公式 Eq. 12)
+        # 注意：这里的 pred 必须是已经经过 Sigmoid 激活的概率值
+        bce_loss = self.bce(pred, target)
+
+        # 将预测和目标展平为一维张量，以计算交并集
+        pred_flat = pred.view(-1)
+        target_flat = target.view(-1)
+
+        # 2. 计算交集和并集 (对应原文公式 Eq. 13 的核心逻辑)
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum() - intersection
+
+        # 3. 计算 Jaccard 系数 (IoUc)
+        iou = (intersection + self.smooth) / (union + self.smooth)
+
+        # 4. 最小化 Jaccard 损失 (对应原文公式 Eq. 14)
+        jaccard_loss = 1.0 - iou
+
+        # 返回联合 Loss
+        return bce_loss + jaccard_loss
+
+
+import cv2  # 如果文件顶部还没 import，加上
+
+
+class CLAHEGammaPreprocess:
+    """
+    固定预处理：CLAHE（在 LAB 的 L 通道）+ Gamma 校正。
+    用于强化低对比度区域，让浅色病灶在送入网络前就更可见。
+
+    关键：训练和验证都 100% 应用（确定性预处理，不是数据增强）。
+
+    Args:
+        gamma: gamma 校正幂指数
+            < 1.0 提亮暗部（更适合救浅色病灶）
+            = 1.0 不变
+            > 1.0 压暗（强化高对比度区域）
+        clip_limit: CLAHE 的对比度限制
+        tile_grid_size: CLAHE 的网格大小
+    """
+
+    def __init__(self, gamma=1.5, clip_limit=5.0, tile_grid_size=(8, 8)):
+        self.gamma = gamma
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+        # CLAHE 实例可以复用，每次 apply 返回新数组
+        self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+
+    def __call__(self, data):
+        img, msk = data
+
+        # 确保是 uint8 [0, 255] RGB
+        if img.dtype != np.uint8:
+            # 如果是 [0, 1] float，先放大
+            if img.max() <= 1.5:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = img.astype(np.uint8)
+
+        # 1. RGB → LAB
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        L, A, B = cv2.split(lab)
+
+        # 2. CLAHE 在 L 通道
+        L = self.clahe.apply(L)
+
+        # 3. Gamma 校正（在归一化的 [0,1] 上做）
+        L_norm = L.astype(np.float32) / 255.0
+        L_norm = np.clip(L_norm, 1e-6, 1.0)
+        L_norm = np.power(L_norm, self.gamma)
+        L = (L_norm * 255).astype(np.uint8)
+
+        # 4. 合回 LAB → RGB
+        lab = cv2.merge([L, A, B])
+        img_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+        # mask 不变
+        return img_enhanced, msk

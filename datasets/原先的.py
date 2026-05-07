@@ -8,19 +8,14 @@ import h5py
 import torch
 from scipy import ndimage
 from scipy.ndimage.interpolation import zoom
-
-# 👑 导入你编写的模糊病灶增强器
-from utils import myFaintLesionAugmentor
+from torch.utils.data import Dataset
+from scipy import ndimage
+from PIL import Image
 
 
 class NPY_datasets(Dataset):
     def __init__(self, path_Data, config, train=True):
-        super(NPY_datasets, self).__init__()
-        self.train = train
-        self.phase = 1  # 默认初始化为 Phase 1
-        # 👑 Phase 1: 训练集设为 7N（1原图+6变体），验证集永远保持 1N
-        self.expand_ratio = 7 if train else 1
-
+        super(NPY_datasets, self)
         if train:
             images_list = sorted(os.listdir(path_Data + 'train/images/'))
             masks_list = sorted(os.listdir(path_Data + 'train/masks/'))
@@ -30,9 +25,6 @@ class NPY_datasets(Dataset):
                 mask_path = path_Data + 'train/masks/' + masks_list[i]
                 self.data.append([img_path, mask_path])
             self.transformer = config.train_transformer
-
-            # 初始化增强器
-            self.faint_augmentor = myFaintLesionAugmentor()
         else:
             images_list = sorted(os.listdir(path_Data + 'val/images/'))
             masks_list = sorted(os.listdir(path_Data + 'val/masks/'))
@@ -43,55 +35,58 @@ class NPY_datasets(Dataset):
                 self.data.append([img_path, mask_path])
             self.transformer = config.test_transformer
 
-    def set_phase(self, phase):
-        """👑 动态切换训练阶段：调整 __len__ 的长度倍率"""
-        self.phase = phase
-        if self.train:
-            if phase == 1:
-                self.expand_ratio = 7
-            elif phase == 2:
-                self.expand_ratio = 1
+    def __getitem__(self, indx):
+        img_path, msk_path = self.data[indx]
+        img = np.array(Image.open(img_path).convert('RGB'))
+        msk = np.expand_dims(np.array(Image.open(msk_path).convert('L')), axis=2) / 255
+        img, msk = self.transformer((img, msk))
+        return img, msk
 
     def __len__(self):
-        return len(self.data) * self.expand_ratio
+        return len(self.data)
 
-    def __getitem__(self, indx):
-        real_idx = indx % len(self.data)
-        aug_idx = indx // len(self.data)
 
-        img_path, mask_path = self.data[real_idx]
-        image = np.array(Image.open(img_path).convert('RGB'))
-        label = np.array(Image.open(mask_path).convert('L'))
+def random_rot_flip(image, label):
+    k = np.random.randint(0, 4)
+    image = np.rot90(image, k)
+    label = np.rot90(label, k)
+    axis = np.random.randint(0, 2)
+    image = np.flip(image, axis=axis).copy()
+    label = np.flip(label, axis=axis).copy()
+    return image, label
 
-        label = np.expand_dims(label, axis=-1)
-        label = (label > 127).astype(np.float32)
 
-        if self.train:
-            if self.phase == 1 and aug_idx > 0:
-                # Phase 1：高强度探索，必定生成特定的 6 种变体
-                mode_map = {1: 'diffuse', 2: 'donut', 3: 'nested', 4: 'multi', 5: 'shattered', 6: 'ghost'}
-                current_mode = mode_map.get(aug_idx, 'diffuse')
-                image, label = self.faint_augmentor.apply_specific_mode((image, label), mode=current_mode)
+def random_rotate(image, label):
+    angle = np.random.randint(-20, 20)
+    image = ndimage.rotate(image, angle, order=0, reshape=False)
+    label = ndimage.rotate(label, angle, order=0, reshape=False)
+    return image, label
 
-            elif self.phase == 2:
-                # 👑 Phase 2 修复：在 1N 数据集中，依然保留 25% 的概率随机生成一种极其微弱的变体
-                # 这样 Decoder 就绝对不敢屏蔽 Encoder 传来的浅色特征了
-                if random.random() < 0.50:
-                    random_mode = random.choice(['diffuse', 'donut', 'shattered', 'ghost'])
-                    image, label = self.faint_augmentor.apply_specific_mode((image, label), mode=random_mode)
 
-            image, label = self.transformer((image, label))
-        else:
-            image, label = self.transformer((image, label))
+class RandomGenerator(object):
+    def __init__(self, output_size):
+        self.output_size = output_size
 
-        return image, label.long()
+    def __call__(self, sample):
+        image, label = sample['image'], sample['label']
+
+        if random.random() > 0.5:
+            image, label = random_rot_flip(image, label)
+        elif random.random() > 0.5:
+            image, label = random_rotate(image, label)
+        x, y = image.shape
+        if x != self.output_size[0] or y != self.output_size[1]:
+            image = zoom(image, (self.output_size[0] / x, self.output_size[1] / y), order=3)  # why not 3?
+            label = zoom(label, (self.output_size[0] / x, self.output_size[1] / y), order=0)
+        image = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+        label = torch.from_numpy(label.astype(np.float32))
+        sample = {'image': image, 'label': label.long()}
+        return sample
 
 
 class Synapse_dataset(Dataset):
-    """(保留原有 Synapse 代码，不做改动)"""
-
     def __init__(self, base_dir, list_dir, split, transform=None):
-        self.transform = transform
+        self.transform = transform  # using transform in torch!
         self.split = split
         self.sample_list = open(os.path.join(list_dir, self.split + '.txt')).readlines()
         self.data_dir = base_dir
@@ -107,12 +102,13 @@ class Synapse_dataset(Dataset):
             image, label = data['image'], data['label']
         else:
             vol_name = self.sample_list[idx].strip('\n')
-            filepath = self.data_dir + "/{}.npy".format(vol_name)
-            data = np.load(filepath)
-            image, label = data[:]
+            filepath = self.data_dir + "/{}.npy.h5".format(vol_name)
+            data = h5py.File(filepath)
+            image, label = data['image'][:], data['label'][:]
 
         sample = {'image': image, 'label': label}
         if self.transform:
             sample = self.transform(sample)
         sample['case_name'] = self.sample_list[idx].strip('\n')
         return sample
+

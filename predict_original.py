@@ -8,14 +8,14 @@ from PIL import Image
 from models.vmunet.vmunet import VMUNet
 
 # --- 配置参数 ---
-MODEL_PATH = '/root/root/VM-UNet/results/original/checkpoints/best-epoch40-loss0.2778.pth'
+MODEL_PATH = '/root/root/VM-UNet/results/FC-9164-REAl/checkpoints/best-epoch48-miou0.9160.pth'
 IMG_SIZE = 256
-INPUT_DIR = 'inputs'
-OUTPUT_DIR = 'outputs_original'
+INPUT_DIR = 'inputsm'
+OUTPUT_DIR = ('outputs_fcph2')
 
 # 作者 utils.py 里写的 ISIC18 测试集固定均值和方差
-ISIC18_TEST_MEAN = 149.034
-ISIC18_TEST_STD = 32.022
+ISIC18_TEST_MEAN = 154.568
+ISIC18_TEST_STD = 58.175
 
 
 def preprocess_exact_author_logic(img_pil, target_size):
@@ -58,7 +58,7 @@ def main():
     model = VMUNet(
         num_classes=1,
         input_channels=3,
-        depths=[2, 2, 2, 2],
+        depths=[2, 2, 9, 2],
         depths_decoder=[2, 2, 2, 1],
         drop_path_rate=0.2,
         load_ckpt_path=None,

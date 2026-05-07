@@ -10,14 +10,14 @@ from models.vmunet.vmunetff import VMUNet
 # ==========================================
 # ⚙️ 配置参数 (记得确认权重路径)
 # ==========================================
-MODEL_PATH = '/root/root/VM-UNet/results/vmunet_isic18_Thursday_26_March_2026_21h_06m_13s/checkpoints/best.pth'
+MODEL_PATH = '/root/root/VM-UNet/results/FC-9164-REAl/checkpoints/best-epoch48-miou0.9160.pth'
 IMG_SIZE = 256
 INPUT_DIR = 'inputs'
 OUTPUT_DIR = 'output_debug'
 THRESHOLD = 0.5
 
-ISIC18_TEST_MEAN = 149.034
-ISIC18_TEST_STD = 32.022
+ISIC18_TEST_MEAN = 154.568
+ISIC18_TEST_STD = 58.175
 
 
 def preprocess_exact_author_logic(img_pil, target_size):

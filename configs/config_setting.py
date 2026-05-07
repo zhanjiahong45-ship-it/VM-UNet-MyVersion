@@ -19,7 +19,7 @@ class setting_config:
         'load_ckpt_path': './pre_trained_weights/vmamba_small_e238_ema.pth',
     }
 
-    datasets = 'isic18'
+    datasets = 'isic17'
     if datasets == 'isic18':
         data_path = './data/isic18/'
     elif datasets == 'isic17':
@@ -27,8 +27,6 @@ class setting_config:
     else:
         raise Exception('datasets in not right!')
 
-        # 👑 替换掉原有的 BceDiceLoss
-        # 换上专治“漏检”的非对称 Loss，强迫模型去抓模糊边界
     criterion = BceDiceLoss(wb=1, wd=1)
 
     pretrained_path = './pre_trained/'
@@ -38,7 +36,7 @@ class setting_config:
     input_channels = 3
     distributed = False
     local_rank = -1
-    num_workers = 16
+    num_workers = 4
     seed = 42
     world_size = None
     rank = None
@@ -55,9 +53,9 @@ class setting_config:
     val_interval = 1
     save_interval = 100
     threshold = 0.50
-    only_test_and_save_figs = False
+    only_test_and_save_figs = True
 
-    best_ckpt_path = '/root/root/VM-UNet/results/9_8288/checkpoints/best-epoch76-miou0.8288.pth'
+    best_ckpt_path = '/root/root/VM-UNet/results/vmunet_isic17_Thursday_07_May_2026_13h_43m_26s/checkpoints/best.pth'
     img_save_path = ''
 
     train_transformer = transforms.Compose([
@@ -80,8 +78,7 @@ class setting_config:
                    'SGD'], 'Unsupported optimizer!'
 
     if opt == 'AdamW':
-        # 2. Batch Size 是原来的 2 倍 (32 -> 64)
-        # 学习率也要相应调整，推荐使用 4e-4 (即原来 2e-4 的两倍)
+        # 👑 回调 3：恢复 2e-4，给足模型冲刺 83 分的动力
         lr = 2e-4
         betas = (0.9, 0.999)
         eps = 1e-8
