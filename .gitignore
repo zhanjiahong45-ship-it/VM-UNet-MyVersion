@@ -64,3 +64,9 @@ pip-log.txt
 .coverage
 htmlcov/
 .pytest_cache/
+
+# ==========================================
+# 4. 特定文件排除
+# ==========================================
+# 排除vmambaff.py（不要推送到GitHub）
+models/vmunet/vmambaff.py

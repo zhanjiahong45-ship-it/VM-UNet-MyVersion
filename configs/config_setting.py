@@ -42,7 +42,7 @@ class setting_config:
     rank = None
     amp = True
     gpu_id = '0'
-    batch_size = 32
+    batch_size = 16
 
     # 👑 回调 2：设定为 120 轮。前 60 轮冲刺，后 60 轮在低学习率下精细沉降
     epochs = 120
